@@ -7,6 +7,7 @@
   <a href="/admin/library" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Library</a>
   <a href="/admin/sources" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sources</a>
   <a href="/admin/settings" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Settings</a>
+  <a href="/admin/search-log" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Search log</a>
   <form method="post" action="/logout" class="ml-auto">
     <button type="submit" class="text-sm text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sign out</button>
   </form>
@@ -27,6 +28,10 @@
   <a href="/admin/settings" class="block p-4 rounded-lg border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 transition-colors">
     <div class="font-medium mb-1">Settings</div>
     <div class="text-sm text-gray-500 dark:text-gray-400">SMTP credentials and Cloudflare Turnstile keys.</div>
+  </a>
+  <a href="/admin/search-log" class="block p-4 rounded-lg border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 transition-colors">
+    <div class="font-medium mb-1">Search log</div>
+    <div class="text-sm text-gray-500 dark:text-gray-400">Recent queries, top searches, and outcome stats from the audit log.</div>
   </a>
 </div>
 {% endblock %}
