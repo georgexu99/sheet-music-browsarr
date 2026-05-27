@@ -43,6 +43,29 @@ impl Imslp {
         Ok(Self { http })
     }
 
+    /// Find a preview image for a work page by scraping the wiki page
+    /// for the first `imslp.org/imglnks/.../*.{png,jpg,jpeg,gif}` URL.
+    /// Used by the lazy `/thumbnail/imslp/:id` route; the resolved URL is
+    /// cached in `AppState::thumbnail_cache` so each work is scraped once
+    /// per 24h window per process.
+    pub async fn find_thumbnail_url(&self, page_id: &str) -> anyhow::Result<String> {
+        let page_url = format!("https://imslp.org/wiki/{}", page_id);
+        let html = self
+            .http
+            .get(&page_url)
+            .send()
+            .await
+            .context("imslp page fetch")?
+            .error_for_status()
+            .context("imslp page status")?
+            .text()
+            .await
+            .context("imslp page body")?;
+
+        scrape_thumbnail_image_url(&html)
+            .ok_or_else(|| anyhow::anyhow!("no preview image found on {page_url}"))
+    }
+
     /// Resolve a work page id to a direct PDF URL. Prefers the IMSLP CDN
     /// (`imslp.org/imglnks/.../*.pdf`); falls back to the
     /// `Special:ImagefromIndex/...` form and follows it once to extract the
@@ -181,19 +204,25 @@ impl Source for Imslp {
                 .map(String::from)
                 .filter(|s| !s.is_empty());
             let id = page_id_from_url(&url).unwrap_or_else(|| title.clone());
+            // IMSLP's OpenSearch API doesn't return thumbnails inline.
+            // Point the browser at our own lazy /thumbnail/imslp/:id
+            // endpoint; it scrapes the wiki page on first hit, caches the
+            // resolved CDN URL for 24h, and redirects.
+            let thumbnail_url = Some(format!("/thumbnail/imslp/{}", id));
             results.push(SearchResult {
                 source: "imslp".to_string(),
                 id,
                 title,
                 description: desc,
                 external_url: url,
-                // IMSLP's OpenSearch API doesn't return thumbnails; pulling
-                // them would require an extra page fetch per result, which
-                // we avoid for search-time latency reasons.
-                thumbnail_url: None,
+                thumbnail_url,
             });
         }
         Ok(results)
+    }
+
+    async fn thumbnail_url(&self, id: &str) -> anyhow::Result<String> {
+        self.find_thumbnail_url(id).await
     }
 
     async fn fetch_pdf_bytes(&self, id: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
@@ -249,6 +278,40 @@ fn absolutize(href: &str) -> String {
     } else {
         format!("https://imslp.org{href}")
     }
+}
+
+/// Pull the first `imslp.org/imglnks/.../*.{png,jpg,jpeg,gif}` URL out of
+/// an IMSLP wiki page. The first inline image on a work page is almost
+/// always the preview render of the primary score.
+fn scrape_thumbnail_image_url(html: &str) -> Option<String> {
+    let needle = "imslp.org/imglnks/";
+    let mut search_start = 0;
+    while let Some(rel) = html[search_start..].find(needle) {
+        let abs = search_start + rel;
+        let prefix = &html[..abs];
+        let scheme_start = match prefix.rfind("https://").or_else(|| prefix.rfind("http://")) {
+            Some(s) => s,
+            None => {
+                search_start = abs + needle.len();
+                continue;
+            }
+        };
+        let tail = &html[scheme_start..];
+        let term_idx = tail
+            .find(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r'))
+            .unwrap_or(tail.len());
+        let url = &tail[..term_idx];
+        let lower = url.to_lowercase();
+        if lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".gif")
+        {
+            return Some(url.to_string());
+        }
+        search_start = abs + needle.len();
+    }
+    None
 }
 
 fn scrape_cdn_pdf_url(html: &str) -> Option<String> {

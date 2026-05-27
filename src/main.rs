@@ -47,14 +47,19 @@ async fn main() -> anyhow::Result<()> {
     let musescore = sources::musescore::Musescore::new()?;
     let sources: Vec<Arc<dyn sources::Source>> =
         vec![Arc::new(imslp), Arc::new(mutopia), Arc::new(musescore)];
+    let source_ids: Vec<&'static str> = sources.iter().map(|s| s.id()).collect();
+    let source_health = sources::health::new(&source_ids);
     let secrets = secrets::Secrets::new(&cfg.secret_key)?;
     let search_cache = cache::new_search_cache();
+    let thumbnail_cache = cache::new_thumbnail_cache();
     let state = routes::AppState {
         pool,
         sources,
         secrets,
         search_cache,
+        thumbnail_cache,
         library_path: cfg.library_path.clone(),
+        source_health,
     };
 
     let app = Router::new()

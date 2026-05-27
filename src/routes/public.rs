@@ -20,6 +20,7 @@ use crate::i18n;
 use crate::rate_limit;
 use crate::secrets::Secrets;
 use crate::settings;
+use crate::sources::health;
 use crate::sources::{SearchResult, Source};
 use crate::turnstile;
 use std::sync::Arc;
@@ -66,9 +67,46 @@ pub fn router() -> Router<AppState> {
         .route("/static/app.css", get(app_css))
         .route("/search", get(search))
         .route("/pdf/:source_id/:id", get(pdf_handler))
+        .route("/thumbnail/:source_id/:id", get(thumbnail_handler))
         .route("/email", post(email_handler))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
+}
+
+/// Lazy thumbnail resolver. The IMSLP search emits `thumbnail_url`
+/// pointing at this endpoint; the browser fetches it as the user scrolls
+/// each card into view; we scrape the source's page (cached in
+/// `state.thumbnail_cache` for 24h) and redirect to the source's CDN.
+/// Sources without an override return Err from `Source::thumbnail_url`
+/// and we 404 — the template's `onerror` handler then hides the broken
+/// image.
+async fn thumbnail_handler(
+    State(state): State<AppState>,
+    Path((source_id, id)): Path<(String, String)>,
+) -> Response {
+    let key = format!("{source_id}:{id}");
+
+    if let Some(url) = state.thumbnail_cache.get(&key).await {
+        return Redirect::temporary(&url).into_response();
+    }
+
+    let source = match state.find_source(&source_id) {
+        Some(s) => s,
+        None => {
+            return (axum::http::StatusCode::NOT_FOUND, "unknown source").into_response();
+        }
+    };
+
+    match source.thumbnail_url(&id).await {
+        Ok(url) => {
+            state.thumbnail_cache.insert(key, url.clone()).await;
+            Redirect::temporary(&url).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, source = %source_id, id = %id, "thumbnail fetch failed");
+            (axum::http::StatusCode::NOT_FOUND, "no thumbnail").into_response()
+        }
+    }
 }
 
 async fn app_css() -> Response {
@@ -158,11 +196,19 @@ async fn search(
         })
         .collect();
     let search_cache: SearchCache = state.search_cache.clone();
+    let health_map = state.source_health.clone();
     let futures = pairs.into_iter().map(|(src, v)| {
         let cache = search_cache.clone();
+        let health = health_map.clone();
         async move {
             match cache::cached_search(&cache, &src, &v, SEARCH_LIMIT_PER_SOURCE).await {
-                Ok(rs) => rs,
+                Ok(rs) => {
+                    // Cache hits also count as "ok" — if the cache has a
+                    // valid entry, the source was reachable within the last
+                    // TTL (60s), which is good enough for liveness.
+                    health::record_ok(&health, src.id());
+                    rs
+                }
                 Err(e) => {
                     tracing::warn!(
                         source = src.id(),
@@ -170,6 +216,7 @@ async fn search(
                         error = %e,
                         "source search failed"
                     );
+                    health::record_err(&health, src.id(), &e.to_string());
                     Vec::new()
                 }
             }
@@ -265,6 +312,7 @@ async fn pdf_handler(
 
     match source.fetch_pdf_bytes(&id, MAX_PDF_BYTES).await {
         Ok(bytes) => {
+            health::record_ok(&state.source_health, source.id());
             audit::record(
                 &state.pool,
                 &ip,
@@ -290,6 +338,7 @@ async fn pdf_handler(
                 error = %e,
                 "fetch_pdf_bytes failed; falling back to external_url"
             );
+            health::record_err(&state.source_health, source.id(), &e.to_string());
             audit::record(
                 &state.pool,
                 &ip,

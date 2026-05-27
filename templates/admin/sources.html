@@ -1,0 +1,125 @@
+{% extends "base.html" %}
+{% block title %}Sources &mdash; sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav class="flex items-center gap-4 text-sm border-b border-gray-200 dark:border-gray-800 pb-3 mb-6">
+  <a href="/" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Search</a>
+  <a href="/admin" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Admin</a>
+  <a href="/admin/library" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Library</a>
+  <a href="/admin/sources" class="text-gray-900 dark:text-gray-100 font-medium">Sources</a>
+  <a href="/admin/settings" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Settings</a>
+  <form method="post" action="/logout" class="ml-auto">
+    <button type="submit" class="text-sm text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sign out</button>
+  </form>
+</nav>
+
+<h1 class="text-2xl font-semibold tracking-tight mb-1">Sources</h1>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-6">
+  Live in-memory liveness (resets on container restart) plus durable per-source PDF history from the audit log.
+</p>
+
+<section class="mb-8">
+  <h2 class="text-base font-medium mb-3">Live status</h2>
+  {% if health.is_empty() %}
+    <p class="text-sm text-gray-500 dark:text-gray-400">No sources registered.</p>
+  {% else %}
+    <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800">
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 dark:bg-gray-900 text-gray-600 dark:text-gray-400 text-left">
+          <tr>
+            <th class="px-3 py-2 font-medium">Source</th>
+            <th class="px-3 py-2 font-medium">Status</th>
+            <th class="px-3 py-2 font-medium">Last OK</th>
+            <th class="px-3 py-2 font-medium">Last error</th>
+            <th class="px-3 py-2 font-medium">Streak</th>
+            <th class="px-3 py-2 font-medium">Totals (ok / fail)</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+          {% for h in health %}
+            <tr>
+              <td class="px-3 py-2 font-mono">{{ h.source_id }}</td>
+              <td class="px-3 py-2">
+                {% if h.status == "healthy" %}
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800 dark:bg-green-950 dark:text-green-200">healthy</span>
+                {% else if h.status == "degraded" %}
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-200">degraded</span>
+                {% else %}
+                  <span class="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300">unknown</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2 text-gray-500 dark:text-gray-400 font-mono text-xs">
+                {% match h.last_ok %}
+                  {% when Some with (t) %}{{ t }}
+                  {% when None %}&mdash;
+                {% endmatch %}
+              </td>
+              <td class="px-3 py-2 text-gray-500 dark:text-gray-400 text-xs">
+                {% match h.last_error_at %}
+                  {% when Some with (t) %}
+                    <div class="font-mono">{{ t }}</div>
+                    {% match h.last_error_msg %}
+                      {% when Some with (m) %}
+                        <div class="mt-1 text-gray-600 dark:text-gray-300 break-all">{{ m }}</div>
+                      {% when None %}
+                    {% endmatch %}
+                  {% when None %}&mdash;
+                {% endmatch %}
+              </td>
+              <td class="px-3 py-2 text-xs">
+                {% if h.consecutive_oks > 0 %}
+                  <span class="text-green-700 dark:text-green-300">{{ h.consecutive_oks }} ok</span>
+                {% else if h.consecutive_fails > 0 %}
+                  <span class="text-red-700 dark:text-red-300">{{ h.consecutive_fails }} fail</span>
+                {% else %}
+                  <span class="text-gray-500 dark:text-gray-400">&mdash;</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2 text-gray-500 dark:text-gray-400 font-mono text-xs">
+                {{ h.total_ok }} / {{ h.total_fail }}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+
+<section>
+  <h2 class="text-base font-medium mb-3">Recent PDF / library activity (audit log)</h2>
+  {% if activity.is_empty() %}
+    <p class="text-sm text-gray-500 dark:text-gray-400">No PDF or library activity recorded yet.</p>
+  {% else %}
+    <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800">
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 dark:bg-gray-900 text-gray-600 dark:text-gray-400 text-left">
+          <tr>
+            <th class="px-3 py-2 font-medium">Source</th>
+            <th class="px-3 py-2 font-medium">Action</th>
+            <th class="px-3 py-2 font-medium">Result</th>
+            <th class="px-3 py-2 font-medium">Count</th>
+            <th class="px-3 py-2 font-medium">Last seen</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+          {% for row in activity %}
+            <tr>
+              <td class="px-3 py-2 font-mono">{{ row.source }}</td>
+              <td class="px-3 py-2">{{ row.action }}</td>
+              <td class="px-3 py-2">
+                {% if row.result == "ok" %}
+                  <span class="text-green-700 dark:text-green-300">{{ row.result }}</span>
+                {% else %}
+                  <span class="text-red-700 dark:text-red-300">{{ row.result }}</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2 font-mono">{{ row.count }}</td>
+              <td class="px-3 py-2 text-gray-500 dark:text-gray-400 font-mono text-xs">{{ row.last_ts }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

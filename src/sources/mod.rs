@@ -53,4 +53,14 @@ pub trait Source: Send + Sync {
     /// from a single code path. Sources that have to do multi-step
     /// resolution (token mint, disclaimer follow, etc.) hide that here.
     async fn fetch_pdf_bytes(&self, id: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>>;
+
+    /// Optional lazy thumbnail resolver. Sources whose search response
+    /// already carries a thumbnail URL (`SearchResult::thumbnail_url`)
+    /// should leave this as the default Err — the route never reaches them.
+    /// Sources that need an extra HTTP call to discover the thumbnail
+    /// (e.g., IMSLP scrapes the wiki page) override this, and the
+    /// `/thumbnail/{source}/{id}` route caches the result.
+    async fn thumbnail_url(&self, _id: &str) -> anyhow::Result<String> {
+        anyhow::bail!("source does not provide lazy thumbnails")
+    }
 }

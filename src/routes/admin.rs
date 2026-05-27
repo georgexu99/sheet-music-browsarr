@@ -17,6 +17,7 @@ use tower_sessions::Session;
 
 use crate::audit;
 use crate::settings;
+use crate::sources::health;
 
 use super::AppState;
 
@@ -38,6 +39,33 @@ struct LibraryRow {
 }
 
 #[derive(Template)]
+#[template(path = "admin/sources.html")]
+struct AdminSources {
+    health: Vec<HealthRow>,
+    activity: Vec<ActivityRow>,
+}
+
+struct HealthRow {
+    source_id: &'static str,
+    status: &'static str,
+    last_ok: Option<String>,
+    last_error_at: Option<String>,
+    last_error_msg: Option<String>,
+    consecutive_fails: u32,
+    consecutive_oks: u32,
+    total_ok: u64,
+    total_fail: u64,
+}
+
+struct ActivityRow {
+    source: String,
+    action: String,
+    result: String,
+    count: i64,
+    last_ts: String,
+}
+
+#[derive(Template)]
 #[template(path = "admin/settings.html")]
 struct AdminSettings {
     smtp_host: String,
@@ -56,6 +84,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/library", get(library_get))
         .route("/admin/library/add", post(library_add))
         .route("/admin/settings", get(settings_get).post(settings_post))
+        .route("/admin/sources", get(sources_get))
         .route_layer(middleware::from_fn(require_admin))
 }
 
@@ -344,5 +373,76 @@ async fn render_settings(state: &AppState, message: Option<String>) -> AdminSett
         turnstile_site_key,
         turnstile_secret_set,
         message,
+    }
+}
+
+async fn sources_get(State(state): State<AppState>) -> impl IntoResponse {
+    let snapshot = health::snapshot(&state.source_health);
+    let health: Vec<HealthRow> = snapshot
+        .into_iter()
+        .map(|(id, h)| HealthRow {
+            source_id: id,
+            status: if h.is_degraded() {
+                "degraded"
+            } else if h.last_ok.is_some() {
+                "healthy"
+            } else {
+                "unknown"
+            },
+            last_ok: h.last_ok.and_then(|t| t.format(&Rfc3339).ok()),
+            last_error_at: h.last_error_at.and_then(|t| t.format(&Rfc3339).ok()),
+            last_error_msg: h.last_error_msg,
+            consecutive_fails: h.consecutive_fails,
+            consecutive_oks: h.consecutive_oks,
+            total_ok: h.total_ok,
+            total_fail: h.total_fail,
+        })
+        .collect();
+
+    let activity = load_recent_activity(&state).await;
+    AdminSources { health, activity }
+}
+
+/// Audit-log-backed per-source PDF + library_add history. The Plan agent's
+/// recommendation: don't persist `SourceHealth` to SQLite, but DO surface
+/// the audit log per-source so admins see "MuseScore was failing all
+/// night while I was asleep." Search rows are aggregated across sources
+/// so they're excluded here; live search status lives in the in-memory
+/// `health` snapshot above.
+async fn load_recent_activity(state: &AppState) -> Vec<ActivityRow> {
+    let result = sqlx::query(
+        r#"
+        SELECT
+            substr(target, 1, instr(target, '/') - 1) AS source,
+            action,
+            result,
+            COUNT(*) AS cnt,
+            MAX(ts) AS last_ts
+        FROM audit_log
+        WHERE action IN ('pdf', 'library_add')
+          AND target LIKE '%/%'
+        GROUP BY source, action, result
+        ORDER BY last_ts DESC
+        LIMIT 100
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await;
+
+    match result {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| ActivityRow {
+                source: r.get::<String, _>("source"),
+                action: r.get::<String, _>("action"),
+                result: r.get::<String, _>("result"),
+                count: r.get::<i64, _>("cnt"),
+                last_ts: r.get::<String, _>("last_ts"),
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "load sources activity failed");
+            Vec::new()
+        }
     }
 }

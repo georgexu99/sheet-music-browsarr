@@ -26,6 +26,22 @@ pub fn new_search_cache() -> SearchCache {
         .build()
 }
 
+/// Resolved-thumbnail URL cache. Keyed by `"<source_id>:<item_id>"`.
+/// Source thumbnail URLs are stable for the life of a wiki page revision,
+/// so a long TTL is appropriate (24h). Bounded by entry count to keep
+/// memory predictable.
+pub type ThumbnailCache = Cache<String, String>;
+
+const THUMBNAIL_CACHE_TTL_SECS: u64 = 60 * 60 * 24;
+const THUMBNAIL_CACHE_MAX_ENTRIES: u64 = 5000;
+
+pub fn new_thumbnail_cache() -> ThumbnailCache {
+    Cache::builder()
+        .max_capacity(THUMBNAIL_CACHE_MAX_ENTRIES)
+        .time_to_live(Duration::from_secs(THUMBNAIL_CACHE_TTL_SECS))
+        .build()
+}
+
 /// Cache-aside wrapper around `Source::search`. Cache miss runs the real
 /// search and inserts the result; cache hit returns the cached Vec
 /// directly (callers clone as needed for ownership).
