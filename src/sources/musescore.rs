@@ -852,4 +852,78 @@ mod tests {
             "Fur Elise"
         );
     }
+
+    // ----- Integration smoke test (Phase D) -----
+    //
+    // `#[ignore]` so it never runs as part of `cargo test`. Exercises the
+    // whole MuseScore pipeline against the live site:
+    //   search → score page → bundle fetch → rewrite_bundle → Boa →
+    //   /api/jmuse → per-page PNGs → printpdf assembly.
+    //
+    // Designed for the CI Linux runner; the Windows dev host can't link
+    // boa_engine without gcc. Run manually with:
+    //
+    //     cargo test --ignored musescore_smoke -- --nocapture
+    //
+    // Failure modes guide where the rewriter / pipeline is broken:
+    //   * "musescore search HTTP …" — Phase B headers needed
+    //   * "could not find musescore bundle URL …" — Phase E rewriter
+    //   * "MD5 module not found in bundle" — Phase E (find_md5_module_id)
+    //   * "randomToken salt not found in bundle" — Phase E (find_random_token)
+    //   * "generateToken call: …" / "window.generateToken missing" — Phase E (Boa eval)
+    //   * "musescore jmuse error: …" — token mint wrong, or MuseScore Pro content
+    //   * "bytes don't start with %PDF-1." — printpdf re-encode regression
+    //
+    // Override the score id via MUSESCORE_SMOKE_QUERY / MUSESCORE_SMOKE_ID
+    // env vars to pin to a known-stable score when MuseScore takes one
+    // down. Default query "bach" should always return free public-domain
+    // user uploads.
+    #[tokio::test]
+    #[ignore]
+    async fn musescore_smoke_search_and_fetch_pdf() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let m = Musescore::new().expect("Musescore::new");
+
+        let query =
+            std::env::var("MUSESCORE_SMOKE_QUERY").unwrap_or_else(|_| "bach".to_string());
+
+        let results = m
+            .search(&query, 5)
+            .await
+            .expect("search must not error for a stable query");
+        assert!(!results.is_empty(), "search returned 0 results for {query:?}");
+
+        // If env-pinned, prefer that id. Otherwise try each result in
+        // order until one's PDF resolves — guards against the top result
+        // being MuseScore-Pro-only content.
+        let candidates: Vec<String> = match std::env::var("MUSESCORE_SMOKE_ID").ok() {
+            Some(id) => vec![id],
+            None => results.iter().take(3).map(|r| r.id.clone()).collect(),
+        };
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for id in &candidates {
+            match m.fetch_pdf_bytes(id, 25 * 1024 * 1024).await {
+                Ok(bytes) => {
+                    assert!(
+                        bytes.starts_with(b"%PDF-1."),
+                        "id={id} bytes don't start with %PDF-1.; got first 8 bytes: {:?}",
+                        &bytes[..bytes.len().min(8)]
+                    );
+                    assert!(bytes.len() > 1024, "id={id} PDF suspiciously small: {} B", bytes.len());
+                    eprintln!("OK: id={id} bytes={} (first 8 bytes look like a PDF)", bytes.len());
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("id={id} fetch failed: {e:#}");
+                    last_err = Some(e);
+                }
+            }
+        }
+        panic!(
+            "all {} candidate score ids failed; last error: {:?}",
+            candidates.len(),
+            last_err.expect("at least one candidate"),
+        );
+    }
 }

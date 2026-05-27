@@ -8,6 +8,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Phase D smoke test — exercises the MuseScore pipeline end-to-end against
+  # the live site. `continue-on-error: true` so it never blocks deploy:
+  # MuseScore can be rate-limiting or Cloudflare-challenging at any moment,
+  # and we still want the build to ship. The signal is the test outcome on
+  # the Actions tab, plus the captured stderr (which the test panics with).
+  musescore-smoke:
+    name: MuseScore smoke
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    if: github.event_name != 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test --ignored musescore_smoke
+        run: cargo test --ignored musescore_smoke -- --nocapture
+
   build:
     runs-on: ubuntu-latest
     permissions:
