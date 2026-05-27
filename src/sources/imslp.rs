@@ -285,34 +285,65 @@ fn absolutize(href: &str) -> String {
     }
 }
 
-/// Pull the first `imslp.org/imglnks/.../*.{png,jpg,jpeg,gif}` URL out of
-/// an IMSLP wiki page. The first inline image on a work page is almost
-/// always the preview render of the primary score.
+/// Pull a usable preview-image URL out of an IMSLP wiki page.
+///
+/// IMSLP serves preview images from two paths, **neither of which is**
+/// `imslp.org/imglnks/` (that path is the PDF download endpoint, not a
+/// thumbnail bucket — the original scraper was looking in the wrong
+/// place, which is why every page returned "no preview image found"):
+///
+///   1. `cdn.imslp.org/images/thumb/pdfs/<hash-prefix>/<hash>.png` —
+///      auto-generated first-page thumbnails of uploaded PDFs. These are
+///      the most reliable signal that we've grabbed actual score content
+///      and not e.g. a publisher logo.
+///   2. `imslp.org/images/thumb/<hash-prefix>/<hash>/<size>px-TN-<title>.{png,jpg}` —
+///      MediaWiki-generated thumbnails of edition cover scans. The `TN-`
+///      prefix is IMSLP's naming convention.
+///
+/// We try (1) first since it's an actual sheet-music page render. (2) is
+/// a fallback for works where only a cover scan is uploaded. URLs may be
+/// absolute (`https://`), protocol-relative (`//cdn.imslp.org/...`), or
+/// site-relative (`/images/thumb/...`) — `absolutize` normalises all
+/// three.
 fn scrape_thumbnail_image_url(html: &str) -> Option<String> {
-    let needle = "imslp.org/imglnks/";
+    // Pass 1: per-PDF auto-thumbnail on the cdn.imslp.org subdomain.
+    if let Some(url) = find_image_url_containing(html, "cdn.imslp.org/images/thumb/pdfs/") {
+        return Some(url);
+    }
+    // Pass 2: any /images/thumb/ — cover scans, MediaWiki TN thumbnails.
+    if let Some(url) = find_image_url_containing(html, "/images/thumb/") {
+        return Some(url);
+    }
+    None
+}
+
+/// Find the first URL in `html` that contains `needle` and ends in a
+/// common image extension. Robust to absolute, protocol-relative, and
+/// site-relative forms — we walk back to the last attribute-boundary
+/// character (quote, whitespace, angle bracket) rather than searching for
+/// a scheme prefix, so `src="//cdn..."` and `src="/images/..."` both
+/// resolve cleanly.
+fn find_image_url_containing(html: &str, needle: &str) -> Option<String> {
     let mut search_start = 0;
     while let Some(rel) = html[search_start..].find(needle) {
         let abs = search_start + rel;
         let prefix = &html[..abs];
-        let scheme_start = match prefix.rfind("https://").or_else(|| prefix.rfind("http://")) {
-            Some(s) => s,
-            None => {
-                search_start = abs + needle.len();
-                continue;
-            }
-        };
-        let tail = &html[scheme_start..];
+        let url_start = prefix
+            .rfind(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r' | '\t'))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let tail = &html[url_start..];
         let term_idx = tail
-            .find(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r'))
+            .find(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r' | '\t'))
             .unwrap_or(tail.len());
-        let url = &tail[..term_idx];
-        let lower = url.to_lowercase();
+        let raw = &tail[..term_idx];
+        let lower = raw.to_lowercase();
         if lower.ends_with(".png")
             || lower.ends_with(".jpg")
             || lower.ends_with(".jpeg")
             || lower.ends_with(".gif")
         {
-            return Some(url.to_string());
+            return Some(absolutize(raw));
         }
         search_start = abs + needle.len();
     }
@@ -345,4 +376,89 @@ fn scrape_cdn_pdf_url(html: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Fixture: minimal HTML matching the shapes that appear on a real
+    // IMSLP work page (verified against the Chopin Nocturnes Op. 9 page
+    // on 2026-05-27). Both URL forms appear in attribute context, with
+    // surrounding tags.
+    const FIXTURE_BOTH: &str = r#"
+        <html>
+          <body>
+            <img src="/images/thumb/2/2d/TN-PMLP2312-cover.png/120px-TN-PMLP2312-cover.png" alt="cover">
+            <p>Some text</p>
+            <img src="//cdn.imslp.org/images/thumb/pdfs/98/23530132146cbeaa9ba0d105f91e9102d0fb124c.png">
+          </body>
+        </html>
+    "#;
+
+    const FIXTURE_COVER_ONLY: &str = r#"
+        <img src="/images/thumb/a/a0/TN-Chopin_Nocturnes_Cover.jpg/438px-TN-Chopin_Nocturnes_Cover.jpg">
+    "#;
+
+    const FIXTURE_NONE: &str = r#"
+        <html>
+          <body>
+            <p>No images here.</p>
+            <a href="/imglnks/usimg/foo.pdf">Download PDF</a>
+          </body>
+        </html>
+    "#;
+
+    #[test]
+    fn prefers_cdn_pdf_thumbnail_over_cover() {
+        let url = scrape_thumbnail_image_url(FIXTURE_BOTH).expect("should find a thumbnail");
+        assert!(
+            url.starts_with("https://cdn.imslp.org/images/thumb/pdfs/"),
+            "expected cdn.imslp.org PDF thumbnail first, got {url}"
+        );
+        assert!(url.ends_with(".png"));
+    }
+
+    #[test]
+    fn falls_back_to_cover_when_no_pdf_thumbnail() {
+        let url = scrape_thumbnail_image_url(FIXTURE_COVER_ONLY).expect("should find cover");
+        assert!(
+            url.starts_with("https://imslp.org/images/thumb/"),
+            "expected absolutized imslp.org cover, got {url}"
+        );
+        assert!(url.ends_with(".jpg"));
+    }
+
+    #[test]
+    fn returns_none_when_page_has_no_thumbnails() {
+        assert!(scrape_thumbnail_image_url(FIXTURE_NONE).is_none());
+    }
+
+    #[test]
+    fn absolutize_handles_protocol_relative() {
+        assert_eq!(
+            absolutize("//cdn.imslp.org/foo.png"),
+            "https://cdn.imslp.org/foo.png"
+        );
+    }
+
+    #[test]
+    fn absolutize_handles_site_relative() {
+        assert_eq!(
+            absolutize("/images/thumb/foo.png"),
+            "https://imslp.org/images/thumb/foo.png"
+        );
+    }
+
+    // Regression: the old scraper only matched URLs containing
+    // `imslp.org/imglnks/` and only walked back to `https://`. Any page
+    // with the actual thumbnail paths (cdn.imslp.org/.../pdfs/ or
+    // /images/thumb/) returned None, which is what made every IMSLP
+    // result render with the placeholder SVG on 2026-05-27. This test
+    // would have failed under the old implementation.
+    #[test]
+    fn regression_old_scraper_would_have_missed_real_imslp_shapes() {
+        assert!(scrape_thumbnail_image_url(FIXTURE_BOTH).is_some());
+        assert!(scrape_thumbnail_image_url(FIXTURE_COVER_ONLY).is_some());
+    }
 }
