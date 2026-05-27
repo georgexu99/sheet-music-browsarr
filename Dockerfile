@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       rsync \
       openssh-client \
       tini \
+      poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user (PUID/PGID conventions match the rest of the NAS stacks).

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -9,6 +10,15 @@ use reqwest::Client;
 use scraper::{Html, Selector};
 
 use super::{SearchResult, Source};
+
+/// Cap on the PDF size we'll download just to generate a thumbnail.
+/// Most Mutopia PDFs are well under this; engraved scores grow with
+/// page count, and we only need page 1, so refusing oversized PDFs
+/// here keeps thumbnail generation latency bounded.
+const THUMBNAIL_PDF_MAX_BYTES: usize = 4 * 1024 * 1024;
+/// Hard wall-clock cap on pdftoppm. Page-1 rasterization on a typical
+/// score takes <1s; 15s is safety margin for a runaway invocation.
+const PDFTOPPM_TIMEOUT_SECS: u64 = 15;
 
 const USER_AGENT: &str = concat!(
     "sheet-music-browsarr/",
@@ -117,10 +127,17 @@ impl Source for Mutopia {
                 if title.is_empty() {
                     continue;
                 }
-                let thumbnail_url = derive_thumbnail_url(&url);
+                let id = encode_url(&url);
+                // Point at our lazy server-rendered thumbnail route.
+                // Mutopia hosts no preview API, so the route shells out
+                // to pdftoppm at request time and caches the PNG in
+                // moka (see `routes::public::thumbnail_handler`). The
+                // template's `loading="lazy"` keeps this off the search
+                // critical path.
+                let thumbnail_url = Some(format!("/thumbnail/mutopia/{id}"));
                 out.push(SearchResult {
                     source: "mutopia".to_string(),
-                    id: encode_url(&url),
+                    id,
                     title,
                     description: None,
                     external_url: url,
@@ -176,6 +193,77 @@ impl Source for Mutopia {
         }
         Ok(bytes)
     }
+
+    /// Rasterize the first page of the work's PDF to PNG. Mutopia has
+    /// no preview-image API, so we fetch the (small) PDF and shell out
+    /// to `pdftoppm` from the runtime image's `poppler-utils` package.
+    /// The route caches the returned bytes in moka so subsequent loads
+    /// of the same result skip the fetch + rasterize entirely.
+    async fn thumbnail_bytes(&self, id: &str) -> anyhow::Result<(Vec<u8>, &'static str)> {
+        let pdf_bytes = self.fetch_pdf_bytes(id, THUMBNAIL_PDF_MAX_BYTES).await?;
+
+        // pdftoppm is a synchronous CLI — run the spawn + read on a
+        // blocking thread so it doesn't stall the async runtime. We
+        // can't pipe the PDF in on stdin because pdftoppm only writes
+        // its output to a file prefix (no stdout streaming for -png
+        // -singlefile), so a real on-disk temp file is unavoidable.
+        let png = tokio::time::timeout(
+            Duration::from_secs(PDFTOPPM_TIMEOUT_SECS),
+            tokio::task::spawn_blocking(move || rasterize_first_page(&pdf_bytes)),
+        )
+        .await
+        .context("pdftoppm timed out")?
+        .context("pdftoppm task join")??;
+
+        Ok((png, "image/png"))
+    }
+}
+
+/// Synchronous body of `thumbnail_bytes`: writes the PDF to a temp
+/// directory, runs `pdftoppm`, and reads the resulting PNG back. The
+/// `TempDir` handle is dropped at function exit so both files are
+/// cleaned up even on error paths.
+fn rasterize_first_page(pdf_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
+    let dir = tempfile::tempdir().context("create temp dir")?;
+    let pdf_path = dir.path().join("in.pdf");
+    let out_prefix = dir.path().join("out");
+
+    {
+        let mut f = std::fs::File::create(&pdf_path).context("open temp pdf")?;
+        f.write_all(pdf_bytes).context("write temp pdf")?;
+        f.flush().ok();
+    }
+
+    // `-singlefile` writes exactly one PNG named `<prefix>.png` (no
+    // page-number suffix). `-r 72` keeps the image small (one screen
+    // DPI is plenty for a card thumbnail). `-f 1 -l 1` defends against
+    // multi-page output if a future poppler version changes defaults.
+    let out = std::process::Command::new("pdftoppm")
+        .arg("-png")
+        .arg("-singlefile")
+        .arg("-r")
+        .arg("72")
+        .arg("-f")
+        .arg("1")
+        .arg("-l")
+        .arg("1")
+        .arg(&pdf_path)
+        .arg(&out_prefix)
+        .output()
+        .context("spawn pdftoppm")?;
+
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!(
+            "pdftoppm exit {:?}: {}",
+            out.status.code(),
+            stderr.trim()
+        );
+    }
+
+    let png_path = dir.path().join("out.png");
+    let png = std::fs::read(&png_path).context("read pdftoppm output")?;
+    Ok(png)
 }
 
 fn absolutize(href: &str) -> String {
@@ -203,16 +291,3 @@ fn decode_url(id: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
-/// Derive a Mutopia preview-image URL from a PDF URL.
-/// Mutopia ships LilyPond-rendered previews next to each piece's PDF
-/// at `<base>-pre.png`, where the PDF is `<base>-{a4,let}.pdf`.
-/// Returns None on unexpected shapes so the template falls back to the
-/// generic placeholder.
-fn derive_thumbnail_url(pdf_url: &str) -> Option<String> {
-    let without_pdf = pdf_url.strip_suffix(".pdf").or_else(|| pdf_url.strip_suffix(".PDF"))?;
-    let base = without_pdf
-        .strip_suffix("-let")
-        .or_else(|| without_pdf.strip_suffix("-a4"))
-        .unwrap_or(without_pdf);
-    Some(format!("{base}-pre.png"))
-}
