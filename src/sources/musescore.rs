@@ -302,6 +302,7 @@ impl Source for Musescore {
                 external_url: s
                     .href
                     .unwrap_or_else(|| format!("https://musescore.com/score/{}", s.id)),
+                thumbnail_url: s.thumbnail_url,
             });
         }
         Ok(results)
@@ -390,6 +391,7 @@ struct SearchScore {
     title: String,
     composer_name: Option<String>,
     href: Option<String>,
+    thumbnail_url: Option<String>,
 }
 
 /// Look for the JS bundle URL that matches the upstream extension's regex:
@@ -734,11 +736,30 @@ fn extract_search_scores(html: &str) -> Option<Vec<SearchScore>> {
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from);
+        // Try several known thumbnail field shapes — MuseScore's hydration
+        // schema has shifted over time. First hit wins; None falls back to
+        // the placeholder in the template.
+        let thumbnail_url = s
+            .get("thumbnails")
+            .and_then(|t| {
+                t.get("original")
+                    .or_else(|| t.get("large"))
+                    .or_else(|| t.get("medium"))
+                    .or_else(|| t.get("small"))
+            })
+            .and_then(|x| x.as_str())
+            .or_else(|| s.get("share_pic_url").and_then(|x| x.as_str()))
+            .or_else(|| s.get("share_pic").and_then(|x| x.as_str()))
+            .or_else(|| s.get("cover_pic").and_then(|x| x.as_str()))
+            .or_else(|| s.get("thumbnail_url").and_then(|x| x.as_str()))
+            .filter(|s| !s.is_empty())
+            .map(String::from);
         out.push(SearchScore {
             id,
             title,
             composer_name,
             href,
+            thumbnail_url,
         });
     }
     Some(out)

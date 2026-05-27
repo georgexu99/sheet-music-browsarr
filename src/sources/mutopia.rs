@@ -117,12 +117,14 @@ impl Source for Mutopia {
                 if title.is_empty() {
                     continue;
                 }
+                let thumbnail_url = derive_thumbnail_url(&url);
                 out.push(SearchResult {
                     source: "mutopia".to_string(),
                     id: encode_url(&url),
                     title,
                     description: None,
                     external_url: url,
+                    thumbnail_url,
                 });
             }
             out
@@ -199,4 +201,18 @@ fn decode_url(id: &str) -> Option<String> {
     B64.decode(id.as_bytes())
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
+}
+
+/// Derive a Mutopia preview-image URL from a PDF URL.
+/// Mutopia ships LilyPond-rendered previews next to each piece's PDF
+/// at `<base>-pre.png`, where the PDF is `<base>-{a4,let}.pdf`.
+/// Returns None on unexpected shapes so the template falls back to the
+/// generic placeholder.
+fn derive_thumbnail_url(pdf_url: &str) -> Option<String> {
+    let without_pdf = pdf_url.strip_suffix(".pdf").or_else(|| pdf_url.strip_suffix(".PDF"))?;
+    let base = without_pdf
+        .strip_suffix("-let")
+        .or_else(|| without_pdf.strip_suffix("-a4"))
+        .unwrap_or(without_pdf);
+    Some(format!("{base}-pre.png"))
 }

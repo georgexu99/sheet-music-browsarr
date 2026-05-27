@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+pub mod health;
 pub mod imslp;
 pub mod musescore;
 pub mod mutopia;
@@ -19,6 +20,12 @@ pub struct SearchResult {
     /// the search results UI as a "View on <source>" link and as a graceful
     /// fallback when proxy-streaming the PDF fails.
     pub external_url: String,
+    /// Optional source-native preview image URL. Rendered as a card
+    /// thumbnail. `None` falls back to a generic placeholder. Sources that
+    /// can derive a thumbnail URL cheaply should populate this; sources
+    /// that would need an extra HTTP roundtrip per result should leave it
+    /// `None` to keep search latency bounded.
+    pub thumbnail_url: Option<String>,
 }
 
 /// A backend that knows how to search for sheet music and fetch PDFs for a

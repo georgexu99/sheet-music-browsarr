@@ -187,6 +187,10 @@ impl Source for Imslp {
                 title,
                 description: desc,
                 external_url: url,
+                // IMSLP's OpenSearch API doesn't return thumbnails; pulling
+                // them would require an extra page fetch per result, which
+                // we avoid for search-time latency reasons.
+                thumbnail_url: None,
             });
         }
         Ok(results)
