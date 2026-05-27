@@ -6,6 +6,16 @@
  * class and persists the choice in localStorage. */
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* Explicit content sources. Tailwind v4 auto-detects template files most
+ * of the time, but the Docker build runs `tailwindcss` from `/app` with
+ * paths relative to that CWD and the auto-scan was missing one or more
+ * of our partial templates (most visibly: SVGs in base.html and the
+ * initial-state placeholder rendering at intrinsic browser size when
+ * w-5/w-12 didn't generate). Listing every template directory here is
+ * the defensive belt-and-suspenders fix. */
+@source "../templates/**/*.html";
+@source "../src/**/*.rs";
+
 /* Source badge palette — one entry per Source impl in src/sources/.
  * Tailwind v4 detects classes used in templates by scanning files; these
  * are emitted via `class="source-badge source-badge-{{ source }}"` in

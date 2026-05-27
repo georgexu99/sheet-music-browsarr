@@ -42,7 +42,7 @@
       class="htmx-indicator pointer-events-none absolute right-10 top-1/2 -translate-y-1/2"
       aria-hidden="true"
     >
-      <svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <svg width="16" height="16" class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" aria-hidden="true">
         <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle>
         <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
       </svg>
@@ -59,7 +59,7 @@
       class="hidden peer-[:not(:placeholder-shown)]:flex absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 items-center justify-center rounded-full text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 transition-colors"
       onclick="var i=document.getElementById('search-input'); i.value=''; i.dispatchEvent(new Event('input',{bubbles:true})); i.focus();"
     >
-      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <svg width="16" height="16" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
         <path d="M18 6 6 18M6 6l12 12"/>
       </svg>
     </button>
@@ -108,7 +108,7 @@
           id="source-count-badge"
           class="ml-1.5 inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1 rounded-full bg-gray-900 text-white text-xs font-medium dark:bg-gray-100 dark:text-gray-900 {% if selected_source_count == sources.len() %}hidden{% endif %}"
         >{{ selected_source_count }}</span>
-        <svg class="ml-1.5 -mr-0.5 w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+        <svg width="16" height="16" class="ml-1.5 -mr-0.5 w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
           <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.06l3.71-3.83a.75.75 0 1 1 1.08 1.04l-4.25 4.39a.75.75 0 0 1-1.08 0L5.21 8.27a.75.75 0 0 1 .02-1.06z" clip-rule="evenodd"/>
         </svg>
       </summary>
