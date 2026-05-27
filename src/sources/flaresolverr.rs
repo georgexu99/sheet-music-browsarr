@@ -27,15 +27,19 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Wall-clock cap on the FlareSolverr HTTP call itself. Headless Chromium
-/// startup + challenge solving typically completes in 5–15s; 60s is the
-/// safety net for cold-start or a slow challenge.
-const FS_TIMEOUT: Duration = Duration::from_secs(60);
+/// Wall-clock cap on the FlareSolverr HTTP call itself. With sessions
+/// enabled (see `create_session`) the per-request cost should be a
+/// few seconds — only the first call pays the Chromium-cold-start
+/// tax. 25 s is the trade-off: long enough to absorb a one-off slow
+/// solve, short enough that a wedged FS doesn't make users wait a
+/// full minute before falling back. The previous 60 s was hiding
+/// FS-broken states behind a long spinner.
+const FS_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// `maxTimeout` field passed to FlareSolverr — the budget *it* applies to
-/// solving the challenge. Matches our HTTP-side timeout so the failure
+/// solving the challenge. Match the HTTP-side timeout so the failure
 /// mode is a single clean error rather than a layered double-timeout.
-const FS_MAX_TIMEOUT_MS: u64 = 60_000;
+const FS_MAX_TIMEOUT_MS: u64 = 25_000;
 
 #[derive(Clone)]
 pub struct FlareSolverr {
@@ -95,12 +99,24 @@ pub struct FsCookie {
     pub expires: f64,
 }
 
+/// Request body for `request.get`. `session` is omitted when None so
+/// FlareSolverr falls back to its default ephemeral browser context.
 #[derive(Serialize)]
 struct FsRequest<'a> {
     cmd: &'a str,
     url: &'a str,
     #[serde(rename = "maxTimeout")]
     max_timeout: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<&'a str>,
+}
+
+/// Request body for the `sessions.create` command. Mirrors `request.get`
+/// minus the URL — FlareSolverr just allocates the browser context.
+#[derive(Serialize)]
+struct FsSessionCreate<'a> {
+    cmd: &'a str,
+    session: &'a str,
 }
 
 impl FlareSolverr {
@@ -110,15 +126,54 @@ impl FlareSolverr {
         Ok(Self { http, base_url })
     }
 
+    /// Create a persistent FlareSolverr session. The session keeps a
+    /// Chromium browser context alive between calls so subsequent
+    /// `request.get` calls referencing the same `session` skip the
+    /// cold-start cost and reuse cookies (including `cf_clearance`).
+    /// Without sessions, MuseScore's 4-variant fan-out spins up 4
+    /// parallel cold Chromium instances per query, which routinely
+    /// overloads FS and times out.
+    pub async fn create_session(&self, session: &str) -> anyhow::Result<()> {
+        let endpoint = format!("{}/v1", self.base_url);
+        let body = FsSessionCreate {
+            cmd: "sessions.create",
+            session,
+        };
+        let env: FsEnvelope = self
+            .http
+            .post(&endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context("flaresolverr sessions.create request")?
+            .error_for_status()
+            .context("flaresolverr sessions.create HTTP status")?
+            .json()
+            .await
+            .context("flaresolverr sessions.create json")?;
+        if env.status != "ok" {
+            anyhow::bail!(
+                "flaresolverr sessions.create status={} message={:?}",
+                env.status,
+                env.message
+            );
+        }
+        Ok(())
+    }
+
     /// Issue a GET through FlareSolverr. Bubbles up the FS error on
     /// non-`ok` status so the caller's error path treats CF failures
-    /// uniformly with direct-fetch failures.
-    pub async fn get(&self, url: &str) -> anyhow::Result<FsSolution> {
+    /// uniformly with direct-fetch failures. When `session` is Some,
+    /// FS reuses the persistent browser context created earlier via
+    /// `create_session` — drastically faster than the default
+    /// ephemeral mode for repeated calls.
+    pub async fn get(&self, url: &str, session: Option<&str>) -> anyhow::Result<FsSolution> {
         let endpoint = format!("{}/v1", self.base_url);
         let body = FsRequest {
             cmd: "request.get",
             url,
             max_timeout: FS_MAX_TIMEOUT_MS,
+            session,
         };
         let env: FsEnvelope = self
             .http

@@ -100,6 +100,15 @@ pub struct Musescore {
     /// set at startup; None otherwise. `fetch_html_challenged()` routes
     /// through it when present and falls back to direct otherwise.
     fs: Option<FlareSolverr>,
+    /// Lazily-created FS session ID. The first FS-routed request
+    /// creates the session (FS allocates a persistent Chromium
+    /// browser context), and subsequent requests pass the same ID so
+    /// FS reuses the context instead of cold-starting per call. Big
+    /// win for the 4-CJK-variant fan-out — without sessions FS would
+    /// see 4 parallel cold Chromium navigations per query and routinely
+    /// time out. `None` until the first successful session create;
+    /// stays `None` if create ever fails so we degrade to sessionless.
+    fs_session: Mutex<Option<String>>,
     cached: Mutex<Option<CachedAlgorithm>>,
 }
 
@@ -159,8 +168,43 @@ impl Musescore {
             http,
             jar,
             fs,
+            fs_session: Mutex::new(None),
             cached: Mutex::new(None),
         })
+    }
+
+    /// Return the FS session ID for `cmd: request.get`, creating it
+    /// on first use. If session creation fails (FS unreachable, bad
+    /// config, broken Chromium) we return None and the caller will
+    /// degrade to sessionless requests — slower but functional.
+    /// Errors are logged once at warn level; we don't retry within
+    /// a single startup since a persistently-broken FS would just
+    /// burn time on every search.
+    async fn ensure_fs_session(&self) -> Option<String> {
+        let fs = self.fs.as_ref()?;
+        let mut guard = self.fs_session.lock().await;
+        if let Some(s) = guard.as_ref() {
+            return Some(s.clone());
+        }
+        // Use a stable session name so the FS-side context persists
+        // across our process's lifetime. Concurrent first-callers
+        // race on the lock, so only one create_session HTTP call
+        // happens even under bursty traffic.
+        let session_id = "musescore".to_string();
+        match fs.create_session(&session_id).await {
+            Ok(()) => {
+                tracing::info!(session = %session_id, "FlareSolverr session created");
+                *guard = Some(session_id.clone());
+                Some(session_id)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{:#}", e),
+                    "FlareSolverr session create failed; falling back to sessionless mode"
+                );
+                None
+            }
+        }
     }
 
     /// Fetch a Cloudflare-challenged URL. Routes through FlareSolverr if
@@ -171,9 +215,11 @@ impl Musescore {
     async fn fetch_html_challenged(&self, url: &str, ctx_label: &'static str) -> anyhow::Result<String> {
         match &self.fs {
             Some(fs) => {
-                let solution: FsSolution = fs.get(url).await.with_context(|| {
-                    format!("flaresolverr {ctx_label} {url}")
-                })?;
+                let session = self.ensure_fs_session().await;
+                let solution: FsSolution = fs
+                    .get(url, session.as_deref())
+                    .await
+                    .with_context(|| format!("flaresolverr {ctx_label} {url}"))?;
                 if solution.status >= 400 {
                     anyhow::bail!(
                         "flaresolverr {ctx_label} HTTP {}: {}",
