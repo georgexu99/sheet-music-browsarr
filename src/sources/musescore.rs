@@ -1,20 +1,65 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, XObjectTransform};
+use reqwest::cookie::Jar;
+use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
 
-// MuseScore.com aggressively rejects obvious bot UAs (Cloudflare challenge
-// page on the score-page fetch). A modern desktop Chrome UA is required.
-const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+// MuseScore.com sits behind Cloudflare; stale or obvious-bot UAs get the
+// "Just a moment…" challenge page (HTTP 403). The full set of headers a
+// modern desktop Chrome sends on a top-level navigation is what gets us
+// past the basic bot check. Headers safe to send on every request live in
+// `default_headers()`; navigation-only ones (Sec-Fetch-*,
+// Upgrade-Insecure-Requests) are layered per-request via `nav_headers()`
+// so the bundle JS / jmuse XHR / CDN PNG fetches don't misrepresent
+// themselves.
+const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+const ACCEPT_LANGUAGE: &str = "en-US,en;q=0.9";
+const ACCEPT_DOC: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7";
+const SEC_CH_UA: &str =
+    "\"Chromium\";v=\"140\", \"Not?A_Brand\";v=\"24\", \"Google Chrome\";v=\"140\"";
+const SEC_CH_UA_PLATFORM: &str = "\"Windows\"";
 
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Per-request headers a real Chrome sends on a top-level navigation
+/// (typed URL / link click). Cloudflare's bot heuristics weight these
+/// heavily, especially `Sec-Fetch-Site: none` (i.e., not from a referrer).
+/// Layered on top of the Client's `default_headers` for score-page and
+/// search-page fetches only.
+fn nav_headers() -> [(HeaderName, HeaderValue); 6] {
+    [
+        (header::ACCEPT, HeaderValue::from_static(ACCEPT_DOC)),
+        (
+            header::UPGRADE_INSECURE_REQUESTS,
+            HeaderValue::from_static("1"),
+        ),
+        (
+            HeaderName::from_static("sec-fetch-dest"),
+            HeaderValue::from_static("document"),
+        ),
+        (
+            HeaderName::from_static("sec-fetch-mode"),
+            HeaderValue::from_static("navigate"),
+        ),
+        (
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("none"),
+        ),
+        (
+            HeaderName::from_static("sec-fetch-user"),
+            HeaderValue::from_static("?1"),
+        ),
+    ]
+}
 
 /// MuseScore.com — community-uploaded sheet music. The site does not expose
 /// a server-side PDF for user uploads (`is_pdf == 0` for ~all free scores);
@@ -37,6 +82,14 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 /// entry is sufficient — when MuseScore deploys, we re-prepare once.
 pub struct Musescore {
     http: Client,
+    /// Shared cookie jar — anything Cloudflare hands us (`cf_clearance`,
+    /// `__cf_bm`, etc.) gets stashed here automatically and replayed on
+    /// subsequent requests. Wrapped in `Arc` so the FlareSolverr helper
+    /// (when configured — see Phase H) can inject cookies it harvests
+    /// from the challenge-solved response without needing a second client.
+    #[allow(dead_code)] // Currently passed only to Client::cookie_provider;
+                       // kept addressable for future cookie injection.
+    jar: Arc<Jar>,
     cached: Mutex<Option<CachedAlgorithm>>,
 }
 
@@ -48,13 +101,38 @@ struct CachedAlgorithm {
 
 impl Musescore {
     pub fn new() -> anyhow::Result<Self> {
+        // Headers safe to send on every request type (navigation, XHR,
+        // script, CDN). Per-request navigation-only headers are added on
+        // top by callers that need them via `nav_headers()`.
+        let mut default_headers = HeaderMap::new();
+        default_headers.insert(
+            header::ACCEPT_LANGUAGE,
+            HeaderValue::from_static(ACCEPT_LANGUAGE),
+        );
+        default_headers.insert(
+            HeaderName::from_static("sec-ch-ua"),
+            HeaderValue::from_static(SEC_CH_UA),
+        );
+        default_headers.insert(
+            HeaderName::from_static("sec-ch-ua-mobile"),
+            HeaderValue::from_static("?0"),
+        );
+        default_headers.insert(
+            HeaderName::from_static("sec-ch-ua-platform"),
+            HeaderValue::from_static(SEC_CH_UA_PLATFORM),
+        );
+
+        let jar = Arc::new(Jar::default());
         let http = Client::builder()
             .user_agent(USER_AGENT)
             .timeout(TIMEOUT)
             .gzip(true)
+            .default_headers(default_headers)
+            .cookie_provider(jar.clone())
             .build()?;
         Ok(Self {
             http,
+            jar,
             cached: Mutex::new(None),
         })
     }
@@ -63,9 +141,11 @@ impl Musescore {
     /// JSON. Returns (bundle_url, score_meta).
     async fn fetch_score_page(&self, id: &str) -> anyhow::Result<(String, ScoreMeta)> {
         let url = format!("https://musescore.com/score/{id}");
-        let html = self
-            .http
-            .get(&url)
+        let mut req = self.http.get(&url);
+        for (k, v) in nav_headers() {
+            req = req.header(k, v);
+        }
+        let html = req
             .send()
             .await
             .context("musescore page fetch")?
@@ -279,12 +359,11 @@ impl Source for Musescore {
                 urlencoding::encode(query)
             ),
         };
-        let resp = self
-            .http
-            .get(&url)
-            .send()
-            .await
-            .context("musescore search request")?;
+        let mut req = self.http.get(&url);
+        for (k, v) in nav_headers() {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.context("musescore search request")?;
         let status = resp.status();
         if !status.is_success() {
             // Pull a short body snippet for the log — MuseScore returns a
@@ -965,7 +1044,7 @@ mod tests {
     // Designed for the CI Linux runner; the Windows dev host can't link
     // boa_engine without gcc. Run manually with:
     //
-    //     cargo test --ignored musescore_smoke -- --nocapture
+    //     cargo test musescore_smoke -- --ignored --nocapture
     //
     // Failure modes guide where the rewriter / pipeline is broken:
     //   * "musescore search HTTP …" — Phase B headers needed
