@@ -15,11 +15,13 @@ use tower_sessions::Session;
 use crate::audit;
 use crate::auth;
 use crate::email::{self as email_mod, SmtpConfig};
+use crate::i18n;
 use crate::rate_limit;
 use crate::secrets::Secrets;
 use crate::settings;
-use crate::sources::SearchResult;
+use crate::sources::{SearchResult, Source};
 use crate::turnstile;
+use std::sync::Arc;
 
 use super::AppState;
 
@@ -109,31 +111,48 @@ async fn search(
         return render_results(is_htmx, &query, Vec::new(), site_key).into_response();
     }
 
-    // Fan out across all registered sources in parallel. A failing source
-    // gets a logged warn + empty result list; the rest still surface.
-    let futures = state.sources.iter().map(|s| {
-        let src = s.clone();
-        let q = query.clone();
-        async move {
-            match src.search(&q, SEARCH_LIMIT_PER_SOURCE).await {
-                Ok(rs) => (src.id(), rs),
-                Err(e) => {
-                    tracing::warn!(source = src.id(), error = %e, "source search failed");
-                    (src.id(), Vec::new())
-                }
+    // Multilingual expansion: a single user query becomes up to 4 query
+    // variants (English / Simplified / Traditional / Pinyin) when known
+    // composer or instrument names are recognised. See src/i18n/alias.rs.
+    let variants = i18n::expand_query(&query);
+
+    // Cross-product: (source, variant) -> one parallel search future.
+    // Failing futures get a logged warn + empty Vec; nothing poisons the
+    // whole search.
+    let pairs: Vec<(Arc<dyn Source>, String)> = state
+        .sources
+        .iter()
+        .flat_map(|s| {
+            let src = s.clone();
+            variants.iter().map(move |v| (src.clone(), v.clone()))
+        })
+        .collect();
+    let futures = pairs.into_iter().map(|(src, v)| async move {
+        match src.search(&v, SEARCH_LIMIT_PER_SOURCE).await {
+            Ok(rs) => rs,
+            Err(e) => {
+                tracing::warn!(
+                    source = src.id(),
+                    variant = %v,
+                    error = %e,
+                    "source search failed"
+                );
+                Vec::new()
             }
         }
     });
     let groups = join_all(futures).await;
 
-    let mut total = 0usize;
+    // Dedupe across (source, id) — the same work commonly surfaces via
+    // multiple variants (e.g. "Chopin" and "肖邦" both return it).
+    let mut seen = std::collections::HashSet::new();
     let mut results = Vec::new();
-    for (src_id, group) in &groups {
-        total += group.len();
-        let _ = src_id; // only used by audit below
-    }
-    for (_, group) in groups {
-        results.extend(group);
+    for group in groups {
+        for r in group {
+            if seen.insert((r.source.clone(), r.id.clone())) {
+                results.push(r);
+            }
+        }
     }
 
     audit::record(
@@ -143,7 +162,11 @@ async fn search(
         "search",
         Some(&query),
         "ok",
-        Some(&format!(r#"{{"results":{total}}}"#)),
+        Some(&format!(
+            r#"{{"results":{},"variants":{}}}"#,
+            results.len(),
+            variants.len()
+        )),
     )
     .await;
 
