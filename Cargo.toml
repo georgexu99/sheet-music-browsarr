@@ -49,6 +49,16 @@ thiserror = "1"
 time = { version = "0.3", features = ["serde", "formatting", "macros"] }
 async-trait = "0.1"
 
+# Server-side search-result cache. Per (source_id, query) tuple, 60s TTL,
+# 1000-entry LRU cap. Absorbs cross-user repeat queries and shields
+# rate-limited upstreams (IMSLP in particular).
+moka = { version = "0.12", features = ["future"] }
+
+# Fuzzy fallback for the alias dictionary lookup (~60 curated entries).
+# Lets "Chpin" still find Chopin -> the whole multilingual expansion
+# pipeline then kicks in normally.
+strsim = "0.11"
+
 # JS runtime for MuseScore token minting. Pure-Rust to keep the build
 # toolchain-light (no C compiler needed on host or in CI/Docker beyond what
 # Cargo already pulls in). Boa is slower than QuickJS but token minting

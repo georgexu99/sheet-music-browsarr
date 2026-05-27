@@ -81,9 +81,31 @@ impl AliasIndex {
     }
 
     fn lookup(&self, token: &str) -> Option<&AliasRow> {
-        self.by_token
-            .get(&token.to_lowercase())
-            .and_then(|i| self.rows.get(*i))
+        let lower = token.to_lowercase();
+        // Exact match wins.
+        if let Some(idx) = self.by_token.get(&lower) {
+            return self.rows.get(*idx);
+        }
+        // Fuzzy fallback: only for tokens long enough to be ambiguous
+        // (4+ chars). Tolerate ~1 typo per 4 characters via
+        // Damerau-Levenshtein. Bails early on huge length mismatches.
+        let len = lower.chars().count();
+        if len < 4 {
+            return None;
+        }
+        let max_dist = (len / 4).max(1);
+        let mut best: Option<(usize, usize)> = None;
+        for (variant, row_idx) in &self.by_token {
+            let v_len = variant.chars().count();
+            if v_len.abs_diff(len) > max_dist {
+                continue;
+            }
+            let d = strsim::damerau_levenshtein(&lower, variant);
+            if d <= max_dist && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, *row_idx));
+            }
+        }
+        best.and_then(|(_, idx)| self.rows.get(idx))
     }
 }
 
@@ -181,5 +203,23 @@ mod tests {
     fn empty_query_passes_through() {
         let v = expand_query("");
         assert_eq!(v, vec!["".to_string()]);
+    }
+
+    #[test]
+    fn fuzzy_matches_typos() {
+        // One-char typo of "Chopin"
+        let v = expand_query("Chpin nocturne");
+        assert!(
+            v.iter().any(|q| q.contains("肖邦") && q.contains("夜曲")),
+            "expected fuzzy 'Chpin' to expand like 'Chopin', got {:?}",
+            v
+        );
+    }
+
+    #[test]
+    fn fuzzy_rejects_too_far() {
+        // 4-char typo "xxxx" against any 6-char alias should NOT match.
+        let v = expand_query("xxxx");
+        assert_eq!(v, vec!["xxxx".to_string()]);
     }
 }

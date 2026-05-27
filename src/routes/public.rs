@@ -14,6 +14,7 @@ use tower_sessions::Session;
 
 use crate::audit;
 use crate::auth;
+use crate::cache::{self, SearchCache};
 use crate::email::{self as email_mod, SmtpConfig};
 use crate::i18n;
 use crate::rate_limit;
@@ -141,17 +142,21 @@ async fn search(
             variants.iter().map(move |v| (src.clone(), v.clone()))
         })
         .collect();
-    let futures = pairs.into_iter().map(|(src, v)| async move {
-        match src.search(&v, SEARCH_LIMIT_PER_SOURCE).await {
-            Ok(rs) => rs,
-            Err(e) => {
-                tracing::warn!(
-                    source = src.id(),
-                    variant = %v,
-                    error = %e,
-                    "source search failed"
-                );
-                Vec::new()
+    let search_cache: SearchCache = state.search_cache.clone();
+    let futures = pairs.into_iter().map(|(src, v)| {
+        let cache = search_cache.clone();
+        async move {
+            match cache::cached_search(&cache, &src, &v, SEARCH_LIMIT_PER_SOURCE).await {
+                Ok(rs) => rs,
+                Err(e) => {
+                    tracing::warn!(
+                        source = src.id(),
+                        variant = %v,
+                        error = %e,
+                        "source search failed"
+                    );
+                    Vec::new()
+                }
             }
         }
     });

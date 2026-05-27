@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use sqlx::SqlitePool;
 
+use crate::cache::SearchCache;
 use crate::secrets::Secrets;
 use crate::sources::Source;
 
@@ -13,6 +14,7 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub sources: Vec<Arc<dyn Source>>,
     pub secrets: Secrets,
+    pub search_cache: SearchCache,
     pub library_path: String,
 }
 
