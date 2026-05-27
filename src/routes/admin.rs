@@ -8,7 +8,6 @@ use axum::middleware::{self, Next};
 use axum::response::{Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
-use futures_util::StreamExt;
 use serde::Deserialize;
 use sqlx::Row;
 use time::format_description::well_known::Rfc3339;
@@ -105,9 +104,12 @@ async fn load_library(state: &AppState) -> Vec<LibraryRow> {
 
 #[derive(Deserialize)]
 struct AddForm {
-    imslp_id: String,
+    source: String,
+    item_id: String,
     title: String,
 }
+
+const ADMIN_MAX_PDF_BYTES: usize = 25 * 1024 * 1024;
 
 async fn library_add(
     State(state): State<AppState>,
@@ -117,27 +119,43 @@ async fn library_add(
     let ip = audit::client_ip(&headers);
     let ua = audit::user_agent(&headers);
 
-    let imslp_id = form.imslp_id.trim().to_string();
+    let source_id = form.source.trim().to_string();
+    let item_id = form.item_id.trim().to_string();
     let title = form.title.trim().to_string();
-    if imslp_id.is_empty() || title.is_empty() {
-        return render_library_with_message(&state, "Missing imslp_id or title").await;
+    if source_id.is_empty() || item_id.is_empty() || title.is_empty() {
+        return render_library_with_message(&state, "Missing source, item_id, or title").await;
     }
 
-    let url = match state.imslp.fetch_pdf_url(&imslp_id).await {
-        Ok(u) => u,
+    let source = match state.find_source(&source_id) {
+        Some(s) => s,
+        None => {
+            return render_library_with_message(
+                &state,
+                &format!("Unknown source: {source_id}"),
+            )
+            .await;
+        }
+    };
+
+    let bytes = match source.fetch_pdf_bytes(&item_id, ADMIN_MAX_PDF_BYTES).await {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, id = %imslp_id, "library add: no pdf url");
+            tracing::warn!(error = %e, source = %source_id, id = %item_id, "library add: fetch failed");
             audit::record(
                 &state.pool,
                 &ip,
                 ua.as_deref(),
                 "library_add",
-                Some(&imslp_id),
-                "no_pdf_link",
+                Some(&format!("{source_id}/{item_id}")),
+                "fetch_failed",
                 None,
             )
             .await;
-            return render_library_with_message(&state, "Could not find a PDF link on IMSLP").await;
+            return render_library_with_message(
+                &state,
+                &format!("Could not fetch PDF: {e}"),
+            )
+            .await;
         }
     };
 
@@ -149,33 +167,6 @@ async fn library_add(
     }
     path.push(&filename);
 
-    let resp = match state.imslp.http().get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "library add: upstream fetch failed");
-            return render_library_with_message(&state, "Upstream fetch failed").await;
-        }
-    };
-    if !resp.status().is_success() {
-        tracing::warn!(status = %resp.status(), "library add: upstream not ok");
-        return render_library_with_message(&state, "Upstream returned error").await;
-    }
-    let ct = resp
-        .headers()
-        .get(axum::http::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    if !ct.starts_with("application/pdf") {
-        tracing::warn!(content_type = %ct, url = %url, "library add: upstream is not a PDF (likely IMSLP disclaimer)");
-        return render_library_with_message(
-            &state,
-            "IMSLP returned a disclaimer page instead of a PDF. The pre-seeded accept cookies didn't match — try a different IMSLP page id, or open the page on imslp.org once to confirm a PDF is actually available.",
-        )
-        .await;
-    }
-
-    let mut size: i64 = 0;
     let mut file = match fs::File::create(&path).await {
         Ok(f) => f,
         Err(e) => {
@@ -183,25 +174,14 @@ async fn library_add(
             return render_library_with_message(&state, "Could not write file").await;
         }
     };
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => {
-                if let Err(e) = file.write_all(&bytes).await {
-                    tracing::warn!(error = %e, "library add: file write");
-                    return render_library_with_message(&state, "Write error").await;
-                }
-                size += bytes.len() as i64;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "library add: chunk error");
-                return render_library_with_message(&state, "Stream error").await;
-            }
-        }
+    if let Err(e) = file.write_all(&bytes).await {
+        tracing::warn!(error = %e, "library add: file write");
+        return render_library_with_message(&state, "Write error").await;
     }
     if let Err(e) = file.flush().await {
         tracing::warn!(error = %e, "library add: file flush");
     }
+    let size = bytes.len() as i64;
 
     let now = match time::OffsetDateTime::now_utc().format(&Rfc3339) {
         Ok(t) => t,
@@ -209,13 +189,15 @@ async fn library_add(
     };
 
     let path_str = path.to_string_lossy().to_string();
+    let external_url = source.external_url(&item_id);
 
     let queue_id = sqlx::query(
         "INSERT INTO queue_items (title, source, source_url, state, local_path, size_bytes, progress, triggered_by_ip, created_at, updated_at) \
-         VALUES (?, 'imslp', ?, 'done', ?, ?, 1.0, NULL, ?, ?)",
+         VALUES (?, ?, ?, 'done', ?, ?, 1.0, NULL, ?, ?)",
     )
     .bind(&title)
-    .bind(&url)
+    .bind(&source_id)
+    .bind(&external_url)
     .bind(&path_str)
     .bind(size)
     .bind(&now)
@@ -253,7 +235,7 @@ async fn library_add(
         &ip,
         ua.as_deref(),
         "library_add",
-        Some(&imslp_id),
+        Some(&format!("{source_id}/{item_id}")),
         "ok",
         Some(&format!(r#"{{"size":{size}}}"#)),
     )

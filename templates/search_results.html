@@ -6,23 +6,24 @@
   <ul class="results">
     {% for r in results %}
       <li class="result">
-        <div class="title">{{ r.title }}</div>
+        <div class="title">{{ r.title }} <span class="source-badge">[{{ r.source }}]</span></div>
         {% match r.description %}
           {% when Some with (desc) %}
             <div class="desc">{{ desc }}</div>
           {% when None %}
         {% endmatch %}
         <div class="links">
-          <a href="/pdf/imslp/{{ r.id }}" target="_blank" rel="noopener">Open PDF</a>
+          <a href="/pdf/{{ r.source }}/{{ r.id }}" target="_blank" rel="noopener">Open PDF</a>
           &middot;
-          <a href="{{ r.external_url }}" target="_blank" rel="noopener">View on IMSLP</a>
+          <a href="{{ r.external_url }}" target="_blank" rel="noopener">View on source</a>
         </div>
         {% match turnstile_site_key %}
           {% when Some with (site_key) %}
             <details class="email-form">
               <summary>Email me this PDF</summary>
               <form method="post" action="/email">
-                <input type="hidden" name="imslp_id" value="{{ r.id }}">
+                <input type="hidden" name="source" value="{{ r.source }}">
+                <input type="hidden" name="item_id" value="{{ r.id }}">
                 <input type="hidden" name="title" value="{{ r.title }}">
                 <input type="hidden" name="query" value="{{ query }}">
                 <label>Email

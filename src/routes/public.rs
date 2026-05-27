@@ -2,13 +2,12 @@ use std::collections::HashMap;
 
 use askama::Template;
 use askama_axum::IntoResponse;
-use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
-use futures_util::StreamExt;
+use futures_util::future::join_all;
 use serde::Deserialize;
 use sqlx::SqlitePool;
 use tower_sessions::Session;
@@ -19,13 +18,13 @@ use crate::email::{self as email_mod, SmtpConfig};
 use crate::rate_limit;
 use crate::secrets::Secrets;
 use crate::settings;
-use crate::sources::imslp::Imslp;
 use crate::sources::SearchResult;
 use crate::turnstile;
 
 use super::AppState;
 
 const MAX_PDF_BYTES: usize = 10 * 1024 * 1024;
+const SEARCH_LIMIT_PER_SOURCE: usize = 10;
 
 #[derive(Template)]
 #[template(path = "search.html")]
@@ -55,7 +54,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(home))
         .route("/healthz", get(healthz))
         .route("/search", get(search))
-        .route("/pdf/imslp/:id", get(pdf_imslp))
+        .route("/pdf/:source_id/:id", get(pdf_handler))
         .route("/email", post(email_handler))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
@@ -110,35 +109,43 @@ async fn search(
         return render_results(is_htmx, &query, Vec::new(), site_key).into_response();
     }
 
-    let results = match state.imslp.search(&query, 20).await {
-        Ok(r) => {
-            audit::record(
-                &state.pool,
-                &ip,
-                ua.as_deref(),
-                "search",
-                Some(&query),
-                "ok",
-                Some(&format!(r#"{{"results":{}}}"#, r.len())),
-            )
-            .await;
-            r
+    // Fan out across all registered sources in parallel. A failing source
+    // gets a logged warn + empty result list; the rest still surface.
+    let futures = state.sources.iter().map(|s| {
+        let src = s.clone();
+        let q = query.clone();
+        async move {
+            match src.search(&q, SEARCH_LIMIT_PER_SOURCE).await {
+                Ok(rs) => (src.id(), rs),
+                Err(e) => {
+                    tracing::warn!(source = src.id(), error = %e, "source search failed");
+                    (src.id(), Vec::new())
+                }
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, query = %query, "imslp search failed");
-            audit::record(
-                &state.pool,
-                &ip,
-                ua.as_deref(),
-                "search",
-                Some(&query),
-                "upstream_error",
-                None,
-            )
-            .await;
-            Vec::new()
-        }
-    };
+    });
+    let groups = join_all(futures).await;
+
+    let mut total = 0usize;
+    let mut results = Vec::new();
+    for (src_id, group) in &groups {
+        total += group.len();
+        let _ = src_id; // only used by audit below
+    }
+    for (_, group) in groups {
+        results.extend(group);
+    }
+
+    audit::record(
+        &state.pool,
+        &ip,
+        ua.as_deref(),
+        "search",
+        Some(&query),
+        "ok",
+        Some(&format!(r#"{{"results":{total}}}"#)),
+    )
+    .await;
 
     render_results(is_htmx, &query, results, site_key).into_response()
 }
@@ -167,129 +174,77 @@ fn render_results(
     }
 }
 
-async fn pdf_imslp(
+async fn pdf_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    Path((source_id, id)): Path<(String, String)>,
 ) -> Response {
     let ip = audit::client_ip(&headers);
     let ua = audit::user_agent(&headers);
 
-    let imslp_wiki = format!("https://imslp.org/wiki/{}", id);
-
-    let url = match state.imslp.fetch_pdf_url(&id).await {
-        Ok(u) => u,
-        Err(e) => {
-            tracing::warn!(error = %e, id = %id, "imslp pdf url resolve; falling back to wiki redirect");
+    let source = match state.find_source(&source_id) {
+        Some(s) => s,
+        None => {
             audit::record(
                 &state.pool,
                 &ip,
                 ua.as_deref(),
-                "pdf_imslp",
-                Some(&id),
-                "no_pdf_link_redirect",
+                "pdf",
+                Some(&format!("{source_id}/{id}")),
+                "unknown_source",
                 None,
             )
             .await;
-            return Redirect::to(&imslp_wiki).into_response();
+            return (axum::http::StatusCode::NOT_FOUND, "Unknown source").into_response();
         }
     };
 
-    let upstream = match state.imslp.http().get(&url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, url = %url, "imslp pdf fetch failed");
+    match source.fetch_pdf_bytes(&id, MAX_PDF_BYTES).await {
+        Ok(bytes) => {
             audit::record(
                 &state.pool,
                 &ip,
                 ua.as_deref(),
-                "pdf_imslp",
-                Some(&id),
-                "upstream_unreachable_redirect",
+                "pdf",
+                Some(&format!("{source_id}/{id}")),
+                "ok",
+                Some(&format!(r#"{{"bytes":{}}}"#, bytes.len())),
+            )
+            .await;
+            let mut out = HeaderMap::new();
+            out.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+            let fname = sanitize_filename(&id);
+            if let Ok(v) = HeaderValue::from_str(&format!(r#"inline; filename="{fname}.pdf""#)) {
+                out.insert(header::CONTENT_DISPOSITION, v);
+            }
+            (out, bytes).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(
+                source = %source_id,
+                id = %id,
+                error = %e,
+                "fetch_pdf_bytes failed; falling back to external_url"
+            );
+            audit::record(
+                &state.pool,
+                &ip,
+                ua.as_deref(),
+                "pdf",
+                Some(&format!("{source_id}/{id}")),
+                "fetch_failed_redirect",
                 None,
             )
             .await;
-            return Redirect::to(&imslp_wiki).into_response();
+            Redirect::to(&source.external_url(&id)).into_response()
         }
-    };
-
-    if !upstream.status().is_success() {
-        let status = upstream.status();
-        audit::record(
-            &state.pool,
-            &ip,
-            ua.as_deref(),
-            "pdf_imslp",
-            Some(&id),
-            &format!("upstream_{}_redirect", status.as_u16()),
-            None,
-        )
-        .await;
-        return Redirect::to(&imslp_wiki).into_response();
     }
-
-    // Verify upstream actually gave us a PDF. The IMSLP disclaimer interstitial
-    // returns 200 with HTML; passing that through as application/pdf produces
-    // the dreaded "Failed to load PDF document" in the browser.
-    let upstream_ct = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    if !upstream_ct.starts_with("application/pdf") {
-        tracing::warn!(
-            id = %id,
-            resolved_url = %url,
-            content_type = %upstream_ct,
-            "upstream did not return a PDF; redirecting to IMSLP wiki page"
-        );
-        audit::record(
-            &state.pool,
-            &ip,
-            ua.as_deref(),
-            "pdf_imslp",
-            Some(&id),
-            &format!("non_pdf_content_type_redirect:{upstream_ct}"),
-            None,
-        )
-        .await;
-        return Redirect::to(&imslp_wiki).into_response();
-    }
-
-    let mut out_headers = HeaderMap::new();
-    out_headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
-    let fname = sanitize_filename(&id);
-    if let Ok(v) = HeaderValue::from_str(&format!(r#"inline; filename="{fname}.pdf""#)) {
-        out_headers.insert(header::CONTENT_DISPOSITION, v);
-    }
-    if let Some(len) = upstream
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| HeaderValue::from_str(s).ok())
-    {
-        out_headers.insert(header::CONTENT_LENGTH, len);
-    }
-
-    audit::record(
-        &state.pool,
-        &ip,
-        ua.as_deref(),
-        "pdf_imslp",
-        Some(&id),
-        "ok",
-        None,
-    )
-    .await;
-
-    let body = Body::from_stream(upstream.bytes_stream());
-    (out_headers, body).into_response()
 }
 
 #[derive(Deserialize)]
 struct EmailForm {
-    imslp_id: String,
+    source: String,
+    item_id: String,
     title: String,
     recipient: String,
     #[serde(default, rename = "cf-turnstile-response")]
@@ -305,6 +260,11 @@ async fn email_handler(
 ) -> Response {
     let ip = audit::client_ip(&headers);
     let ua = audit::user_agent(&headers);
+
+    let source = match state.find_source(&form.source) {
+        Some(s) => s,
+        None => return flash(&form.query, "Unknown source."),
+    };
 
     let secret = match settings::get_secret(
         &state.pool,
@@ -326,7 +286,14 @@ async fn email_handler(
         }
     };
 
-    if !turnstile::verify(state.imslp.http(), &secret, &form.turnstile_token, Some(&ip)).await {
+    // Reuse one of the sources' http clients for the Turnstile verify
+    // call — any of them will do; they all carry sane timeouts.
+    let verify_http = state
+        .sources
+        .first()
+        .and_then(|_| Some(reqwest::Client::new()))
+        .unwrap_or_default();
+    if !turnstile::verify(&verify_http, &secret, &form.turnstile_token, Some(&ip)).await {
         audit::record(
             &state.pool,
             &ip,
@@ -346,10 +313,7 @@ async fn email_handler(
 
     let buckets: [(String, i64); 3] = [
         ("global:email".to_string(), rate_limit::EMAIL_GLOBAL_PER_DAY),
-        (
-            format!("ip:{ip}:email"),
-            rate_limit::EMAIL_PER_IP_PER_DAY,
-        ),
+        (format!("ip:{ip}:email"), rate_limit::EMAIL_PER_IP_PER_DAY),
         (
             format!("recipient:{}:email", form.recipient.to_lowercase()),
             rate_limit::EMAIL_PER_RECIPIENT_PER_DAY,
@@ -395,10 +359,10 @@ async fn email_handler(
         }
     };
 
-    let pdf_bytes = match fetch_pdf_bytes(&state.imslp, &form.imslp_id).await {
+    let pdf_bytes = match source.fetch_pdf_bytes(&form.item_id, MAX_PDF_BYTES).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::warn!(error = %e, id = %form.imslp_id, "pdf fetch for email");
+            tracing::warn!(error = %e, source = %form.source, id = %form.item_id, "pdf fetch for email");
             audit::record(
                 &state.pool,
                 &ip,
@@ -409,13 +373,14 @@ async fn email_handler(
                 None,
             )
             .await;
-            return flash(&form.query, "Could not fetch the PDF from IMSLP.");
+            return flash(&form.query, "Could not fetch the PDF.");
         }
     };
 
     let subject = format!("Sheet music: {}", form.title);
     let body = format!(
-        "Sheet music from IMSLP:\n\n{}\n\nDelivered via sheet-music-browsarr.",
+        "Sheet music from {}:\n\n{}\n\nDelivered via sheet-music-browsarr.",
+        source.display_name(),
         form.title
     );
     let filename = format!("{}.pdf", sanitize_filename(&form.title));
@@ -454,42 +419,6 @@ async fn email_handler(
             flash(&form.query, "Failed to send email (SMTP error). Try again.")
         }
     }
-}
-
-async fn fetch_pdf_bytes(imslp: &Imslp, id: &str) -> anyhow::Result<Vec<u8>> {
-    let url = imslp.fetch_pdf_url(id).await?;
-    let resp = imslp
-        .http()
-        .get(&url)
-        .send()
-        .await?
-        .error_for_status()?;
-    let ct = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_lowercase();
-    anyhow::ensure!(
-        ct.starts_with("application/pdf"),
-        "upstream returned {ct:?} (not a PDF); IMSLP disclaimer may be blocking"
-    );
-    if let Some(len) = resp.content_length() {
-        anyhow::ensure!(
-            (len as usize) <= MAX_PDF_BYTES,
-            "PDF too large ({len} bytes; cap {MAX_PDF_BYTES})"
-        );
-    }
-    let mut bytes = Vec::with_capacity(64 * 1024);
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk?;
-        if bytes.len() + chunk.len() > MAX_PDF_BYTES {
-            anyhow::bail!("PDF exceeds {MAX_PDF_BYTES} bytes during streaming");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    Ok(bytes)
 }
 
 async fn load_smtp_config(

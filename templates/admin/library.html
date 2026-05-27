@@ -18,10 +18,16 @@
   {% when None %}
 {% endmatch %}
 
-<h2>Save IMSLP work to library</h2>
+<h2>Save work to library</h2>
 <form method="post" action="/admin/library/add">
-  <label>IMSLP page id
-    <input type="text" name="imslp_id" placeholder="e.g. Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric)" required>
+  <label>Source
+    <select name="source" required>
+      <option value="imslp">IMSLP</option>
+      <option value="mutopia">Mutopia Project</option>
+    </select>
+  </label>
+  <label>Item id
+    <input type="text" name="item_id" placeholder="e.g. Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric) for IMSLP" required>
   </label>
   <label>Title
     <input type="text" name="title" placeholder="Display title for the library" required>

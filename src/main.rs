@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use axum::Router;
 use tower_http::compression::CompressionLayer;
@@ -40,10 +41,13 @@ async fn main() -> anyhow::Result<()> {
         .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
 
     let imslp = sources::imslp::Imslp::new()?;
+    let mutopia = sources::mutopia::Mutopia::new()?;
+    let sources: Vec<Arc<dyn sources::Source>> =
+        vec![Arc::new(imslp), Arc::new(mutopia)];
     let secrets = secrets::Secrets::new(&cfg.secret_key)?;
     let state = routes::AppState {
         pool,
-        imslp,
+        sources,
         secrets,
         library_path: cfg.library_path.clone(),
     };
