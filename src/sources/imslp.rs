@@ -237,6 +237,14 @@ impl Source for Imslp {
                 external_url: url,
                 thumbnail_url,
                 metadata: Vec::new(),
+                // IMSLP has no difficulty rating signal in OpenSearch
+                // results. The catalog is PD-focused so we can safely
+                // hard-code is_public_domain. is_official doesn't apply
+                // (IMSLP works are inherently community engravings of PD
+                // works).
+                complexity: None,
+                is_public_domain: Some(true),
+                is_official: None,
             });
         }
 

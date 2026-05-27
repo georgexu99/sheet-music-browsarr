@@ -523,6 +523,23 @@ impl Source for Musescore {
                     kind: BadgeKind::Instrument,
                 });
             }
+            // Surface difficulty as a badge alongside the existing pills.
+            // The filter wiring lands on top of this; the badge stays even
+            // when no difficulty filter is active so users see the level.
+            if let Some(level) = s.complexity {
+                let label = match level {
+                    1 => "Beginner",
+                    2 => "Intermediate",
+                    3 => "Advanced",
+                    _ => "",
+                };
+                if !label.is_empty() {
+                    metadata.push(MetadataBadge {
+                        label: label.to_string(),
+                        kind: BadgeKind::Difficulty,
+                    });
+                }
+            }
             results.push(SearchResult {
                 source: "musescore".to_string(),
                 id: s.id.to_string(),
@@ -533,6 +550,9 @@ impl Source for Musescore {
                     .unwrap_or_else(|| format!("https://musescore.com/score/{}", s.id)),
                 thumbnail_url: s.thumbnail_url,
                 metadata,
+                complexity: s.complexity,
+                is_public_domain: s.is_public_domain,
+                is_official: s.is_official,
             });
         }
         Ok(results)
@@ -631,6 +651,15 @@ struct SearchScore {
     /// usually returns 1–3 entries per score; we render each as its own
     /// pill so they stay short.
     instrumentations: Vec<String>,
+    /// 1 = Beginner, 2 = Intermediate, 3 = Advanced. None when the field
+    /// is absent or out-of-range (defensive against schema drift).
+    complexity: Option<u8>,
+    /// Per-score public-domain flag from the hydration JSON. None on the
+    /// DOM-scrape fallback path (the JSON is no longer in the DOM).
+    is_public_domain: Option<bool>,
+    /// True for "official" publisher engravings, false for community
+    /// uploads. None on the DOM-scrape fallback path.
+    is_official: Option<bool>,
 }
 
 /// Look for the JS bundle URL that matches the upstream extension's regex:
@@ -1005,6 +1034,13 @@ fn extract_search_scores_from_dom(html: &str) -> Option<Vec<SearchScore>> {
             pages_count: None,
             parts_count: None,
             instrumentations: vec![],
+            // Difficulty / PD / official flags live only in the hydration
+            // JSON; the DOM scraper sees the post-React DOM where they've
+            // been stripped. None is "unknown", which is the correct
+            // signal for the filter layer.
+            complexity: None,
+            is_public_domain: None,
+            is_official: None,
         });
     }
 
@@ -1152,6 +1188,23 @@ fn extract_search_scores(html: &str) -> Option<Vec<SearchScore>> {
             .and_then(|x| x.as_u64())
             .map(|n| n as usize);
         let instrumentations = extract_instrumentations(s.get("instrumentations"));
+        // Difficulty / PD / official flags carried by the per-score JSON.
+        // `complexity` is bounded 1..=3 in MuseScore's schema; we drop
+        // anything outside that range rather than render a "Difficulty: 7"
+        // badge if their schema drifts. `is_public_domain` is encoded as
+        // 0/1 in the JSON (not a bool); `is_official` is a real bool.
+        let complexity = s
+            .get("complexity")
+            .and_then(|x| x.as_u64())
+            .filter(|n| (1..=3).contains(n))
+            .map(|n| n as u8);
+        let is_public_domain = s
+            .get("is_public_domain")
+            .and_then(|x| x.as_u64())
+            .map(|n| n != 0);
+        let is_official = s
+            .get("is_official")
+            .and_then(|x| x.as_bool());
         out.push(SearchScore {
             id,
             title,
@@ -1161,6 +1214,9 @@ fn extract_search_scores(html: &str) -> Option<Vec<SearchScore>> {
             pages_count,
             parts_count,
             instrumentations,
+            complexity,
+            is_public_domain,
+            is_official,
         });
     }
     Some(out)

@@ -89,12 +89,95 @@ impl Instrument {
     ];
 }
 
-/// Optional facets the search route forwards to each source. Sources that
-/// can't honour a given filter natively apply a best-effort fallback
-/// (typically appending the instrument slug to the query).
+/// User-selectable difficulty filter. MuseScore is the only catalog that
+/// exposes a complexity signal (1=Beginner, 2=Intermediate, 3=Advanced
+/// on the per-score JSON). Filtering is post-hoc in the route layer
+/// rather than pushed down to each source — there's no upstream facet
+/// to map to and the data is already on `SearchResult`.
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum Difficulty {
+    Beginner,
+    Intermediate,
+    Advanced,
+}
+
+impl Difficulty {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Difficulty::Beginner => "beginner",
+            Difficulty::Intermediate => "intermediate",
+            Difficulty::Advanced => "advanced",
+        }
+    }
+    pub fn display(&self) -> &'static str {
+        match self {
+            Difficulty::Beginner => "Beginner",
+            Difficulty::Intermediate => "Intermediate",
+            Difficulty::Advanced => "Advanced",
+        }
+    }
+    pub fn from_slug(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|d| d.slug() == s)
+    }
+    /// Inverse of MuseScore's `complexity` field (1/2/3 → enum).
+    pub fn from_complexity(c: u8) -> Option<Self> {
+        match c {
+            1 => Some(Difficulty::Beginner),
+            2 => Some(Difficulty::Intermediate),
+            3 => Some(Difficulty::Advanced),
+            _ => None,
+        }
+    }
+    pub const ALL: &'static [Difficulty] = &[
+        Difficulty::Beginner,
+        Difficulty::Intermediate,
+        Difficulty::Advanced,
+    ];
+}
+
+/// Distinguishes publisher-engraved "official" content (Hal Leonard,
+/// ArrangeMe) from community uploads on MuseScore. IMSLP and Mutopia
+/// are inherently community engravings of PD works — they pass
+/// "Community" but are excluded from "Official".
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum ScoreType {
+    Official,
+    Community,
+}
+
+impl ScoreType {
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ScoreType::Official => "official",
+            ScoreType::Community => "community",
+        }
+    }
+    pub fn display(&self) -> &'static str {
+        match self {
+            ScoreType::Official => "Official",
+            ScoreType::Community => "Community",
+        }
+    }
+    pub fn from_slug(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|t| t.slug() == s)
+    }
+    pub const ALL: &'static [ScoreType] = &[ScoreType::Official, ScoreType::Community];
+}
+
+/// Optional facets the search route forwards to each source. `instrument`
+/// is pushed down to upstream sources (Mutopia/MuseScore have native
+/// facets, IMSLP filters post-hoc on title/desc); the other three are
+/// applied centrally in the route handler on the assembled, deduped
+/// result set since the data is already on every `SearchResult`.
 #[derive(Debug, Clone, Default, Hash, Eq, PartialEq)]
 pub struct SearchFilters {
     pub instrument: Option<Instrument>,
+    pub difficulty: Option<Difficulty>,
+    /// True when the user wants only known-PD content. Conservative: a
+    /// result with `is_public_domain == None` (i.e., MuseScore DOM-
+    /// scrape fallback where we can't tell) does NOT pass when set.
+    pub public_domain_only: bool,
+    pub score_type: Option<ScoreType>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -125,6 +208,24 @@ pub struct SearchResult {
     /// latency budget is tight.
     #[serde(default)]
     pub metadata: Vec<MetadataBadge>,
+    /// 1 = Beginner, 2 = Intermediate, 3 = Advanced. MuseScore exposes
+    /// this on community uploads via the `complexity` JSON field. IMSLP /
+    /// Mutopia have no equivalent, so it's None for them.
+    #[serde(default)]
+    pub complexity: Option<u8>,
+    /// True when we know the underlying work is in the public domain.
+    /// IMSLP and Mutopia are catalog-wide PD so we hard-code Some(true);
+    /// MuseScore exposes a per-score `is_public_domain` flag. None means
+    /// "we don't know" (DOM-scrape fallback path on MuseScore can't tell).
+    #[serde(default)]
+    pub is_public_domain: Option<bool>,
+    /// True when the score is an "official" publisher engraving on
+    /// MuseScore (Hal Leonard, ArrangeMe, etc.) rather than a community
+    /// upload. The community-vs-official distinction is MuseScore-only —
+    /// IMSLP and Mutopia are inherently community engravings of PD works,
+    /// so this stays None there.
+    #[serde(default)]
+    pub is_official: Option<bool>,
 }
 
 /// A small contextual metadata pill rendered below the title on a search

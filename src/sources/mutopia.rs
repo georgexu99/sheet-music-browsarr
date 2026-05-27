@@ -237,6 +237,13 @@ impl Source for Mutopia {
                     external_url: url,
                     thumbnail_url,
                     metadata,
+                    // Mutopia has no difficulty signal. The catalog is
+                    // explicitly PD so is_public_domain is hard-coded.
+                    // is_official doesn't apply (community engravings of
+                    // PD works, same shape as IMSLP).
+                    complexity: None,
+                    is_public_domain: Some(true),
+                    is_official: None,
                 });
             }
             out

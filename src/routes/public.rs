@@ -16,7 +16,9 @@ use crate::auth;
 use crate::cache::{self, SearchCache};
 use crate::i18n;
 use crate::sources::health;
-use crate::sources::{Instrument, SearchFilters, SearchResult, Source};
+use crate::sources::{
+    Difficulty, Instrument, ScoreType, SearchFilters, SearchResult, Source,
+};
 use std::sync::Arc;
 
 use super::AppState;
@@ -63,16 +65,22 @@ struct SearchPage {
     /// `{% include %}`, so their context shapes must match.
     next_page: Option<u32>,
     sources: Vec<SourceFilterOption>,
-    instruments: Vec<InstrumentFilterOption>,
+    instruments: Vec<FilterOption>,
+    difficulties: Vec<FilterOption>,
+    score_types: Vec<FilterOption>,
+    /// Current state of the public-domain-only toggle. Distinct from the
+    /// dropdowns because there's no list of options — it's a single
+    /// checkbox chip.
+    public_domain_only: bool,
     /// How many source checkboxes are currently ticked. Drives the count
     /// badge next to "Sources ▾" in the filter dropdown ("Sources [2]"
     /// when not all are selected). Live-updated by a small JS in
     /// search.html on checkbox change since the HTMX swap only updates
     /// `#results`, not the filter UI.
     selected_source_count: usize,
-    /// True iff any filter is set to a non-default value (instrument
-    /// chosen, or at least one source unchecked). Drives the visibility
-    /// of the "Reset filters" link.
+    /// True iff any filter is set to a non-default value (any dropdown
+    /// non-default, any source unticked, or PD-only on). Drives the
+    /// visibility of the "Reset filters" link.
     has_active_filters: bool,
 }
 
@@ -102,10 +110,23 @@ struct SourceFilterOption {
     selected: bool,
 }
 
-struct InstrumentFilterOption {
+/// Generic slug/display/selected triple used by every single-select filter
+/// dropdown (instrument, difficulty, score type). Same shape; the
+/// template just iterates and renders.
+struct FilterOption {
     slug: &'static str,
     display: &'static str,
     selected: bool,
+}
+
+/// Aggregate of every filter-control's UI state. Bundled into one struct
+/// rather than threaded through `build_filter_options`'s return tuple
+/// because adding a new filter would otherwise touch every call site.
+struct FilterUiState {
+    sources: Vec<SourceFilterOption>,
+    instruments: Vec<FilterOption>,
+    difficulties: Vec<FilterOption>,
+    score_types: Vec<FilterOption>,
 }
 
 /// Build the per-render filter UI state.
@@ -116,8 +137,8 @@ struct InstrumentFilterOption {
 fn build_filter_options(
     state: &AppState,
     source_filter: Option<&HashSet<String>>,
-    instrument: Option<Instrument>,
-) -> (Vec<SourceFilterOption>, Vec<InstrumentFilterOption>) {
+    filters: &SearchFilters,
+) -> FilterUiState {
     let sources = state
         .sources
         .iter()
@@ -131,13 +152,74 @@ fn build_filter_options(
         .collect();
     let instruments = Instrument::ALL
         .iter()
-        .map(|i| InstrumentFilterOption {
+        .map(|i| FilterOption {
             slug: i.slug(),
             display: i.display(),
-            selected: instrument == Some(*i),
+            selected: filters.instrument == Some(*i),
         })
         .collect();
-    (sources, instruments)
+    let difficulties = Difficulty::ALL
+        .iter()
+        .map(|d| FilterOption {
+            slug: d.slug(),
+            display: d.display(),
+            selected: filters.difficulty == Some(*d),
+        })
+        .collect();
+    let score_types = ScoreType::ALL
+        .iter()
+        .map(|t| FilterOption {
+            slug: t.slug(),
+            display: t.display(),
+            selected: filters.score_type == Some(*t),
+        })
+        .collect();
+    FilterUiState {
+        sources,
+        instruments,
+        difficulties,
+        score_types,
+    }
+}
+
+/// Post-hoc filter: drop results that don't match the difficulty / PD-only
+/// / score-type filters. `instrument` filtering already happened upstream
+/// (push-down to each source), so we don't re-check it here.
+///
+/// Conservatism on missing data:
+///   - `public_domain_only`: a `None` is_public_domain means "unknown"
+///     (MuseScore DOM-scrape fallback). Drop those when the filter is on
+///     — the user explicitly asked for known-PD only.
+///   - `difficulty`: IMSLP/Mutopia have complexity=None. Drop them when a
+///     specific difficulty is selected; surfacing them would mean "show
+///     me beginner pieces" returns non-beginner content silently.
+///   - `score_type = Community`: keep is_official=Some(false) AND
+///     is_official=None (IMSLP/Mutopia are inherently community).
+///   - `score_type = Official`: only keep is_official=Some(true).
+fn passes_post_hoc(r: &SearchResult, filters: &SearchFilters) -> bool {
+    if filters.public_domain_only && r.is_public_domain != Some(true) {
+        return false;
+    }
+    if let Some(d) = filters.difficulty {
+        if r.complexity.and_then(Difficulty::from_complexity) != Some(d) {
+            return false;
+        }
+    }
+    if let Some(st) = filters.score_type {
+        match st {
+            ScoreType::Official => {
+                if r.is_official != Some(true) {
+                    return false;
+                }
+            }
+            ScoreType::Community => {
+                if r.is_official == Some(true) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 /// Parse the `sources` query param(s). Returns `None` when no `sources` key
@@ -284,9 +366,9 @@ async fn app_css() -> Response {
 }
 
 async fn home(State(state): State<AppState>) -> impl IntoResponse {
-    let (sources, instruments) = build_filter_options(&state, None, None);
-    // Home page: no filters set, every source ticked, no instrument.
-    let selected_source_count = sources.len();
+    let ui = build_filter_options(&state, None, &SearchFilters::default());
+    // Home page: no filters set, every source ticked.
+    let selected_source_count = ui.sources.len();
     SearchPage {
         query: String::new(),
         results: Vec::new(),
@@ -294,8 +376,11 @@ async fn home(State(state): State<AppState>) -> impl IntoResponse {
         next_page: None,
         selected_source_count,
         has_active_filters: false,
-        sources,
-        instruments,
+        public_domain_only: false,
+        sources: ui.sources,
+        instruments: ui.instruments,
+        difficulties: ui.difficulties,
+        score_types: ui.score_types,
     }
 }
 
@@ -319,8 +404,22 @@ async fn search(
     let instrument = first_param(&params, "instrument")
         .filter(|s| !s.is_empty())
         .and_then(Instrument::from_slug);
+    let difficulty = first_param(&params, "difficulty")
+        .filter(|s| !s.is_empty())
+        .and_then(Difficulty::from_slug);
+    let score_type = first_param(&params, "score_type")
+        .filter(|s| !s.is_empty())
+        .and_then(ScoreType::from_slug);
+    // Toggle param accepts "1" or "true" as truthy; anything else is off.
+    let public_domain_only = first_param(&params, "pd_only")
+        .is_some_and(|s| s == "1" || s.eq_ignore_ascii_case("true"));
     let source_filter = parse_source_filter(&params);
-    let filters = SearchFilters { instrument };
+    let filters = SearchFilters {
+        instrument,
+        difficulty,
+        public_domain_only,
+        score_type,
+    };
 
     let is_htmx = headers.get("hx-request").is_some();
     let ip = audit::client_ip(&headers);
@@ -363,7 +462,7 @@ async fn search(
             Vec::new(),
             None,
             source_filter.as_ref(),
-            instrument,
+            &filters,
         );
     }
     if query.chars().count() < SEARCH_MIN_QUERY_LEN {
@@ -380,7 +479,7 @@ async fn search(
             Vec::new(),
             None,
             source_filter.as_ref(),
-            instrument,
+            &filters,
         );
     }
 
@@ -469,6 +568,14 @@ async fn search(
     }
     let deduped_total = results.len();
 
+    // Post-hoc filters (difficulty / pd_only / score_type). Applied
+    // *before* the page-target truncate so pagination semantics stay
+    // sane: page 1 of "Beginner only" returns the first 20 Beginner
+    // results, not "the 20 results that happened to land in page 1
+    // before filtering took out 18 of them". `instrument` was already
+    // applied upstream at the source layer.
+    results.retain(|r| passes_post_hoc(r, &filters));
+
     // Page-1 shows the first SEARCH_PAGE_SIZE; page-N shows the first
     // N * SEARCH_PAGE_SIZE. We always serve the cumulative slice (the
     // "Load more" button replaces the whole `#results` div), which keeps
@@ -536,7 +643,7 @@ async fn search(
         results,
         next_page,
         source_filter.as_ref(),
-        instrument,
+        &filters,
     )
 }
 
@@ -562,7 +669,7 @@ fn render_response(
     results: Vec<SearchResult>,
     next_page: Option<u32>,
     source_filter: Option<&HashSet<String>>,
-    instrument: Option<Instrument>,
+    filters: &SearchFilters,
 ) -> Response {
     if is_htmx {
         ResultsPartial {
@@ -572,12 +679,16 @@ fn render_response(
         }
         .into_response()
     } else {
-        let (sources, instruments) = build_filter_options(state, source_filter, instrument);
-        let selected_source_count = sources.iter().filter(|s| s.selected).count();
+        let ui = build_filter_options(state, source_filter, filters);
+        let selected_source_count = ui.sources.iter().filter(|s| s.selected).count();
         // "Active" = anything diverging from the home-page default (all
-        // sources ticked, no instrument). Drives the Reset-filters link.
-        let has_active_filters =
-            selected_source_count < sources.len() || instrument.is_some();
+        // sources ticked, no dropdown selection, PD-only off). Drives
+        // the Reset-filters link visibility.
+        let has_active_filters = selected_source_count < ui.sources.len()
+            || filters.instrument.is_some()
+            || filters.difficulty.is_some()
+            || filters.score_type.is_some()
+            || filters.public_domain_only;
         SearchPage {
             query: query.to_string(),
             results,
@@ -585,8 +696,11 @@ fn render_response(
             next_page,
             selected_source_count,
             has_active_filters,
-            sources,
-            instruments,
+            public_domain_only: filters.public_domain_only,
+            sources: ui.sources,
+            instruments: ui.instruments,
+            difficulties: ui.difficulties,
+            score_types: ui.score_types,
         }
         .into_response()
     }
