@@ -49,6 +49,16 @@ thiserror = "1"
 time = { version = "0.3", features = ["serde", "formatting", "macros"] }
 async-trait = "0.1"
 
+# JS runtime for MuseScore token minting. Pure-Rust to keep the build
+# toolchain-light (no C compiler needed on host or in CI/Docker beyond what
+# Cargo already pulls in). Boa is slower than QuickJS but token minting
+# happens once per download and runs on a blocking thread anyway.
+boa_engine = { version = "0.21", default-features = false }
+
+# PDF assembly for MuseScore: musescore.com only serves per-page PNGs on
+# free user uploads (no server-side PDF), so we stitch them ourselves.
+printpdf = { version = "0.9", default-features = false, features = ["png"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

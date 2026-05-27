@@ -13,6 +13,7 @@ mod auth;
 mod config;
 mod db;
 mod email;
+mod i18n;
 mod rate_limit;
 mod routes;
 mod secrets;
@@ -42,8 +43,9 @@ async fn main() -> anyhow::Result<()> {
 
     let imslp = sources::imslp::Imslp::new()?;
     let mutopia = sources::mutopia::Mutopia::new()?;
+    let musescore = sources::musescore::Musescore::new()?;
     let sources: Vec<Arc<dyn sources::Source>> =
-        vec![Arc::new(imslp), Arc::new(mutopia)];
+        vec![Arc::new(imslp), Arc::new(mutopia), Arc::new(musescore)];
     let secrets = secrets::Secrets::new(&cfg.secret_key)?;
     let state = routes::AppState {
         pool,

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 pub mod imslp;
+pub mod musescore;
 pub mod mutopia;
 
 #[derive(Debug, Clone, Serialize)]
