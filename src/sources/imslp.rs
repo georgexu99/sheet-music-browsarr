@@ -133,7 +133,7 @@ impl Source for Imslp {
     }
 
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let resp: serde_json::Value = self
+        let resp = self
             .http
             .get("https://imslp.org/api.php")
             .query(&[
@@ -145,9 +145,16 @@ impl Source for Imslp {
             ])
             .send()
             .await
-            .context("imslp opensearch request")?
-            .error_for_status()
-            .context("imslp opensearch status")?
+            .context("imslp opensearch request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Pull a short body snippet for the log — IMSLP often returns
+            // a recognisable rate-limit / blocked-bot page.
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            anyhow::bail!("imslp opensearch HTTP {status}: {snippet}");
+        }
+        let resp: serde_json::Value = resp
             .json()
             .await
             .context("imslp opensearch json")?;
