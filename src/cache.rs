@@ -9,6 +9,12 @@ use crate::sources::{SearchResult, Source};
 pub struct CacheKey {
     pub source: &'static str,
     pub query: String,
+    /// The per-source `limit` passed to `Source::search`. Pagination bumps
+    /// this with each page, and caching the page-1 vec under a key that
+    /// ignored `limit` would cause page 2 to serve the already-truncated
+    /// page-1 results. Including it here keeps each requested page-size
+    /// in its own cache slot.
+    pub limit: usize,
 }
 
 /// Cross-user search-result cache. Entries are `Arc<Vec<SearchResult>>` so
@@ -54,6 +60,7 @@ pub async fn cached_search(
     let key = CacheKey {
         source: source.id(),
         query: query.to_string(),
+        limit,
     };
     if let Some(cached) = cache.get(&key).await {
         return Ok((*cached).clone());
