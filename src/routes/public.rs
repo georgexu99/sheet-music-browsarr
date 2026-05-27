@@ -22,7 +22,15 @@ use std::sync::Arc;
 use super::AppState;
 
 const MAX_PDF_BYTES: usize = 10 * 1024 * 1024;
-const SEARCH_LIMIT_PER_SOURCE: usize = 10;
+/// How many results to ask each upstream source for, on page 1. Set to 20
+/// to match MuseScore's natural search-page size (their /sheetmusic page
+/// always renders 20 cards, capped by our scraper's `.take(limit)` — so
+/// limit=10 was discarding half the cards we'd already fetched for free).
+/// IMSLP's OpenSearch and Mutopia's CGI both handle limit=20 with no extra
+/// upstream cost (single HTTP call, larger response slice). Page N then
+/// fans out to `SEARCH_LIMIT_PER_SOURCE * N` per source, matching the
+/// cumulative target_count.
+const SEARCH_LIMIT_PER_SOURCE: usize = 20;
 /// Target page size for the unified, post-dedup result list. Each page N
 /// shows results 1..(N * SEARCH_PAGE_SIZE) (the simple full-replace
 /// pagination flow — see `search_results.html`). 20 keeps the badge-laden
