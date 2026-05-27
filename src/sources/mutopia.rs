@@ -56,7 +56,7 @@ impl Source for Mutopia {
     }
 
     async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let html = self
+        let resp = self
             .http
             .get(format!("{BASE}/cgibin/make-table.cgi"))
             .query(&[
@@ -72,12 +72,14 @@ impl Source for Mutopia {
             ])
             .send()
             .await
-            .context("mutopia search")?
-            .error_for_status()
-            .context("mutopia search status")?
-            .text()
-            .await
-            .context("mutopia search body")?;
+            .context("mutopia search")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            anyhow::bail!("mutopia search HTTP {status}: {snippet}");
+        }
+        let html = resp.text().await.context("mutopia search body")?;
 
         // Mutopia's results page lays each piece out as a table block. The
         // simplest way to extract them: collect every anchor whose href
@@ -136,9 +138,13 @@ impl Source for Mutopia {
             .get(&url)
             .send()
             .await
-            .context("mutopia pdf fetch")?
-            .error_for_status()
-            .context("mutopia pdf status")?;
+            .context("mutopia pdf fetch")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            anyhow::bail!("mutopia pdf HTTP {status}: {snippet}");
+        }
 
         let ct = resp
             .headers()

@@ -263,17 +263,23 @@ impl Source for Musescore {
             "https://musescore.com/sheetmusic?text={}",
             urlencoding::encode(query)
         );
-        let html = self
+        let resp = self
             .http
             .get(&url)
             .send()
             .await
-            .context("musescore search request")?
-            .error_for_status()
-            .context("musescore search status")?
-            .text()
-            .await
-            .context("musescore search body")?;
+            .context("musescore search request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            // Pull a short body snippet for the log — MuseScore returns a
+            // recognisable bot-block / rate-limit page on failure, and
+            // without the status code we can't tell 403 from 429 from a
+            // layout change.
+            let body = resp.text().await.unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            anyhow::bail!("musescore search HTTP {status}: {snippet}");
+        }
+        let html = resp.text().await.context("musescore search body")?;
 
         let scores = match extract_search_scores(&html) {
             Some(s) => s,
