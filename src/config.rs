@@ -1,6 +1,7 @@
 pub struct Config {
     pub port: u16,
     pub db_path: String,
+    pub library_path: String,
     pub admin_password_init: Option<String>,
     pub secure_cookies: bool,
 }
@@ -15,6 +16,9 @@ impl Config {
         let db_path = std::env::var("BROWSARR_DB_PATH")
             .unwrap_or_else(|_| "sheet-music-browsarr.db".to_string());
 
+        let library_path = std::env::var("BROWSARR_LIBRARY_PATH")
+            .unwrap_or_else(|_| "./library".to_string());
+
         let admin_password_init = std::env::var("BROWSARR_ADMIN_PASSWORD")
             .ok()
             .filter(|s| !s.is_empty());
@@ -27,6 +31,7 @@ impl Config {
         Ok(Self {
             port,
             db_path,
+            library_path,
             admin_password_init,
             secure_cookies,
         })

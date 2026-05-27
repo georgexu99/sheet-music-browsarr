@@ -1,0 +1,48 @@
+{% extends "base.html" %}
+{% block title %}Library &mdash; sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav>
+  <a href="/">Search</a>
+  <a href="/admin">Admin</a>
+  <a href="/admin/library">Library</a>
+  <form method="post" action="/logout" class="inline">
+    <button type="submit">Sign out</button>
+  </form>
+</nav>
+<h1>Library</h1>
+
+{% match message %}
+  {% when Some with (msg) %}
+    <p class="error">{{ msg }}</p>
+  {% when None %}
+{% endmatch %}
+
+<h2>Save IMSLP work to library</h2>
+<form method="post" action="/admin/library/add">
+  <label>IMSLP page id
+    <input type="text" name="imslp_id" placeholder="e.g. Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric)" required>
+  </label>
+  <label>Title
+    <input type="text" name="title" placeholder="Display title for the library" required>
+  </label>
+  <button type="submit">Fetch and save</button>
+</form>
+
+<h2>Existing items ({{ items.len() }})</h2>
+{% if items.is_empty() %}
+  <p>Library is empty.</p>
+{% else %}
+  <table>
+    <thead><tr><th>Title</th><th>Size</th><th>Added</th></tr></thead>
+    <tbody>
+      {% for item in items %}
+        <tr>
+          <td>{{ item.title }}</td>
+          <td>{{ item.size_bytes }} B</td>
+          <td>{{ item.added_at }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+{% endblock %}

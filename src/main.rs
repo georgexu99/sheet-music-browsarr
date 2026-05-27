@@ -7,10 +7,12 @@ use tower_sessions::{Expiry, SessionManagerLayer};
 use tower_sessions_sqlx_store::SqliteStore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
+mod audit;
 mod auth;
 mod config;
 mod db;
 mod routes;
+mod sources;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -32,7 +34,12 @@ async fn main() -> anyhow::Result<()> {
         .with_secure(cfg.secure_cookies)
         .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
 
-    let state = routes::AppState { pool };
+    let imslp = sources::imslp::Imslp::new()?;
+    let state = routes::AppState {
+        pool,
+        imslp,
+        library_path: cfg.library_path.clone(),
+    };
 
     let app = Router::new()
         .merge(routes::public::router())

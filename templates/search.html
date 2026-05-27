@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Search &mdash; sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav>
+  <a href="/">Search</a>
+  <a href="/login">Admin</a>
+</nav>
+<h1>Sheet music search</h1>
+<form hx-get="/search" hx-target="#results" hx-push-url="true">
+  <label>Search
+    <input type="search" name="q" value="{{ query }}" placeholder="composer, piece, opus..." autofocus>
+  </label>
+  <button type="submit">Search</button>
+</form>
+<div id="results">
+  {% include "search_results.html" %}
+</div>
+<script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+{% endblock %}
