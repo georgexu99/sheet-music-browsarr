@@ -166,11 +166,14 @@ impl Source for Imslp {
         // MediaWiki's ranking) and instead filter in-memory after parsing —
         // see the retain() block below. When a filter is active we widen
         // the upstream limit so the filter has more candidates to choose
-        // from before we truncate to the caller's limit.
+        // from before we truncate to the caller's limit. We also always
+        // over-fetch by ~50% to absorb the composer-landing-page filter
+        // (the loop below skips entries that aren't work pages, which
+        // would otherwise leave the caller with fewer than `limit`).
         let upstream_limit = if filters.instrument.is_some() {
             limit.saturating_mul(4).max(20)
         } else {
-            limit
+            limit.saturating_add(limit / 2).max(15)
         };
         let resp = self
             .http
@@ -207,6 +210,21 @@ impl Source for Imslp {
         for (i, title) in titles.iter().enumerate() {
             let title = title.as_str().unwrap_or_default().to_string();
             if title.is_empty() {
+                continue;
+            }
+            // Skip composer landing pages, lists, and other non-work
+            // pages. These appear in OpenSearch results (the namespace=0
+            // filter on the API call doesn't catch them — they're still
+            // article-namespace, just not work pages) and can't be
+            // resolved to a PDF by `find_pdf_url`, so clicking them
+            // produces a `fetch_failed_redirect` to the IMSLP wiki.
+            // IMSLP work pages are reliably titled with the
+            // "(Lastname, Firstname)" composer suffix:
+            //   "Symphony No.9, Op.125 (Beethoven, Ludwig van)"
+            //   "Nocturne Op.9 No.2 (Chopin, Frédéric)"
+            // Composer landing pages and lists don't have it
+            // ("Chopin", "List of compositions by Chopin").
+            if !looks_like_imslp_work_page(&title) {
                 continue;
             }
             let url = urls
@@ -327,6 +345,29 @@ fn page_id_from_url(url: &str) -> Option<String> {
 /// during post-hoc filtering. Most instruments match on their slug alone;
 /// Voice/Choral expand to common formal labels (lieder, mass, etc.) and
 /// Cello includes IMSLP's preferred "violoncello".
+/// Discriminate IMSLP work pages from composer landing pages, lists,
+/// and other non-PDF-resolvable entries that OpenSearch returns in
+/// the same result set. IMSLP work pages reliably end with a
+/// `(Lastname, Firstname)` composer suffix:
+///   "Symphony No.9, Op.125 (Beethoven, Ludwig van)"      ← work
+///   "Nocturne Op.9 No.2 (Chopin, Frédéric)"              ← work
+///   "Chopin"                                              ← composer redirect
+///   "List of compositions by Chopin"                      ← list page
+/// We require a `,` inside a final parenthetical so plain
+/// "(Frédéric Chopin)" or "(en français)" don't accidentally pass.
+fn looks_like_imslp_work_page(title: &str) -> bool {
+    let Some(open) = title.rfind('(') else {
+        return false;
+    };
+    if !title.ends_with(')') {
+        return false;
+    }
+    // Inside the parens, expect "Lastname, Firstname" — at minimum a
+    // comma separator. Filters out non-composer parentheticals like
+    // "(piano transcription)" or "(arr. Brahms)".
+    title[open + 1..title.len() - 1].contains(", ")
+}
+
 fn instrument_keywords(inst: Instrument) -> &'static [&'static str] {
     match inst {
         Instrument::Piano => &["piano"],
@@ -499,6 +540,30 @@ mod tests {
     #[test]
     fn returns_none_when_page_has_no_thumbnails() {
         assert!(scrape_thumbnail_image_url(FIXTURE_NONE).is_none());
+    }
+
+    #[test]
+    fn work_page_filter_accepts_real_work_titles() {
+        assert!(looks_like_imslp_work_page(
+            "Symphony No.9, Op.125 (Beethoven, Ludwig van)"
+        ));
+        assert!(looks_like_imslp_work_page("Nocturne Op.9 No.2 (Chopin, Frédéric)"));
+        assert!(looks_like_imslp_work_page(
+            "Goldberg Variations, BWV 988 (Bach, Johann Sebastian)"
+        ));
+    }
+
+    #[test]
+    fn work_page_filter_rejects_composer_landing_and_lists() {
+        // Bare composer redirect — the case that produced
+        // fetch_failed_redirect on the audit log.
+        assert!(!looks_like_imslp_work_page("Chopin"));
+        // List pages.
+        assert!(!looks_like_imslp_work_page("List of compositions by Chopin"));
+        // Parenthetical without a comma — disambiguator, not composer.
+        assert!(!looks_like_imslp_work_page("Sonata (piano transcription)"));
+        // Parens not at end.
+        assert!(!looks_like_imslp_work_page("Sonata (1820) revisited"));
     }
 
     #[test]
