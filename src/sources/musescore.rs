@@ -448,23 +448,34 @@ impl Source for Musescore {
         let scores = match extract_search_scores(&html) {
             Some(s) => s,
             None => {
-                // Hydration JSON not found. Two common causes:
-                //   1. FlareSolverr returned the challenge interstitial
-                //      ("Just a moment…") instead of the post-challenge
-                //      content — i.e. FS thinks it solved but didn't.
-                //   2. MuseScore changed their SSR hydration format.
-                // Log a clamped snippet + a quick "looks like CF" sniff
-                // so we can tell the two apart without enabling
-                // FlareSolverr's LOG_HTML.
-                let snippet = truncate_for_log(&html, 400);
-                let looks_like_cf = html.contains("Just a moment")
-                    || html.contains("challenge-platform")
-                    || html.contains("cf-mitigated");
+                // Hydration JSON not found. We need three orthogonal signals to
+                // tell apart the failure modes:
+                //   - looks_like_cf: only true on the literal interactive
+                //     challenge ("Just a moment…"). The Cloudflare bot-mgmt JS
+                //     ships on every CF-fronted page even when not challenged,
+                //     so we no longer match on `challenge-platform` /
+                //     `cf-mitigated` — those gave false positives.
+                //   - has_data_hash: `data-<60+hex>="…"` anywhere in the body.
+                //     If true, the SSR hydration shell IS present and our
+                //     parser is the bug. If false, FlareSolverr handed us a
+                //     post-React-hydration DOM where the attribute was
+                //     deleted, and we need a different extraction strategy.
+                //   - snippet_head/_tail: 1 KB from each end of the response
+                //     so we can confirm structure without dumping 300 KB to
+                //     the logs.
+                let looks_like_cf =
+                    html.contains("Just a moment") || html.contains("Attention Required");
+                let has_data_hash = scan_for_data_hash_attr(&html);
+                let snippet_head = truncate_for_log(&html, 1000);
+                let snippet_tail: String = html.chars().rev().take(1000).collect::<String>()
+                    .chars().rev().collect();
                 tracing::warn!(
                     bytes = html.len(),
                     looks_like_cf,
-                    snippet = %snippet,
-                    "musescore search hydration not found; site layout may have changed (or FS didn't clear CF)"
+                    has_data_hash,
+                    snippet_head = %snippet_head,
+                    snippet_tail = %snippet_tail,
+                    "musescore search hydration not found"
                 );
                 return Ok(Vec::new());
             }
@@ -913,6 +924,26 @@ fn html_unescape(s: &str) -> String {
 /// Cloudflare challenge page doesn't flood the logs.
 fn truncate_for_log(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// True iff the HTML contains a `data-<60+ hex chars>="…"` attribute —
+/// MuseScore's SSR hydration container. Used in diagnostics so we can tell
+/// "FS handed us post-React-hydration DOM with the attribute stripped"
+/// (false) apart from "the attribute is here, our parser is buggy" (true).
+fn scan_for_data_hash_attr(html: &str) -> bool {
+    let mut start = 0;
+    while let Some(off) = html[start..].find("data-") {
+        let abs = start + off;
+        let tail = &html[abs + 5..];
+        let hex_end = tail
+            .find(|c: char| !c.is_ascii_hexdigit())
+            .unwrap_or(tail.len());
+        if hex_end >= 60 && tail[hex_end..].starts_with("=\"") {
+            return true;
+        }
+        start = abs + 5;
+    }
+    false
 }
 
 fn extract_score_meta(html: &str) -> Option<ScoreMeta> {
