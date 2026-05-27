@@ -1,0 +1,5 @@
+{# Append-mode partial. Returned by /search?append=1 — the sentinel-fired
+   request that delivers just *one* page's worth of new items into the
+   existing list. No <ul> wrapper because we're inserting into an
+   already-open list via hx-swap="outerHTML" on the previous sentinel. #}
+{% include "_search_results_items.html" %}

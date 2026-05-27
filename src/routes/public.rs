@@ -74,6 +74,18 @@ struct ResultsPartial {
     next_page: Option<u32>,
 }
 
+/// Infinite-scroll append response. Same shape as `ResultsPartial` — both
+/// templates render `_search_results_items.html` — but `append`'s wrapper
+/// drops the `<ul>` because the new items get spliced into the existing
+/// list via `hx-swap="outerHTML"` on the previous sentinel.
+#[derive(Template)]
+#[template(path = "search_results_append.html")]
+struct ResultsAppendPartial {
+    query: String,
+    results: Vec<SearchResult>,
+    next_page: Option<u32>,
+}
+
 struct SourceFilterOption {
     id: &'static str,
     display: &'static str,
@@ -307,6 +319,15 @@ async fn search(
         .filter(|p| *p >= 1 && *p <= SEARCH_MAX_PAGE)
         .unwrap_or(1);
 
+    // Infinite-scroll append mode: triggered by the sentinel `<li>` at the
+    // bottom of the current results list. Returns just *this* page's new
+    // items (sliced from the cumulative dedup) wrapped in a bare partial
+    // that gets spliced into the existing list via hx-swap="outerHTML".
+    // Gated on the HTMX request header so hand-typed `?append=1` URLs
+    // gracefully render the full page instead of a bare fragment.
+    let is_append =
+        is_htmx && first_param(&params, "append").is_some_and(|s| !s.is_empty());
+
     if query.is_empty() {
         audit::record(
             &state.pool,
@@ -318,6 +339,9 @@ async fn search(
             None,
         )
         .await;
+        if is_append {
+            return empty_append(&query);
+        }
         return render_response(
             is_htmx,
             &state,
@@ -332,6 +356,9 @@ async fn search(
         // Typeahead: too short to be useful and the upstream sources will
         // mostly return noise. Return an empty result set silently — the
         // user will keep typing.
+        if is_append {
+            return empty_append(&query);
+        }
         return render_response(
             is_htmx,
             &state,
@@ -471,6 +498,23 @@ async fn search(
     // moka cache (`src/cache.rs`) already absorbs cross-user repeat
     // queries; the browser-side cache would only deduplicate same-user
     // self-repeat which isn't worth the partial-vs-full collision.
+    if is_append {
+        // Split off just this page's new items. The first
+        // `(page-1)*PAGE_SIZE` items were already shown on earlier
+        // scroll triggers; the append partial only needs the delta.
+        let start = (page as usize).saturating_sub(1) * SEARCH_PAGE_SIZE;
+        let new_items = if results.len() > start {
+            results.split_off(start)
+        } else {
+            Vec::new()
+        };
+        return ResultsAppendPartial {
+            query,
+            results: new_items,
+            next_page,
+        }
+        .into_response();
+    }
     render_response(
         is_htmx,
         &state,
@@ -480,6 +524,18 @@ async fn search(
         source_filter.as_ref(),
         instrument,
     )
+}
+
+/// Bare append partial with no items + no sentinel. Used for the
+/// degenerate empty/short-query case so a sentinel-fired request still
+/// gets a clean response shape rather than a render of the full page.
+fn empty_append(query: &str) -> Response {
+    ResultsAppendPartial {
+        query: query.to_string(),
+        results: Vec::new(),
+        next_page: None,
+    }
+    .into_response()
 }
 
 /// HTMX requests get the results-only partial (filter controls live outside
