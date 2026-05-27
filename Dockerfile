@@ -15,6 +15,16 @@ COPY src ./src
 COPY migrations ./migrations
 COPY templates ./templates
 COPY assets ./assets
+COPY build.rs ./
+
+# Tailwind CSS — pull the standalone binary (no Node toolchain needed),
+# compile assets/tailwind.css to dist/styles.css. The Rust binary embeds
+# the result via include_str! at compile time, so this MUST run before
+# `cargo build`.
+ADD --chmod=755 https://github.com/tailwindlabs/tailwindcss/releases/latest/download/tailwindcss-linux-x64 /usr/local/bin/tailwindcss
+RUN mkdir -p dist && \
+    /usr/local/bin/tailwindcss -i ./assets/tailwind.css -o ./dist/styles.css --minify
+
 RUN cargo build --release && \
     strip target/release/sheet-music-browsarr || true
 

@@ -1,56 +1,70 @@
 {% extends "base.html" %}
 {% block title %}Library &mdash; sheet-music-browsarr{% endblock %}
 {% block content %}
-<nav>
-  <a href="/">Search</a>
-  <a href="/admin">Admin</a>
-  <a href="/admin/library">Library</a>
-  <a href="/admin/settings">Settings</a>
-  <form method="post" action="/logout" class="inline">
-    <button type="submit">Sign out</button>
+<nav class="flex items-center gap-4 text-sm border-b border-gray-200 dark:border-gray-800 pb-3 mb-6">
+  <a href="/" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Search</a>
+  <a href="/admin" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Admin</a>
+  <a href="/admin/library" class="text-gray-900 dark:text-gray-100 font-medium">Library</a>
+  <a href="/admin/settings" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Settings</a>
+  <form method="post" action="/logout" class="ml-auto">
+    <button type="submit" class="text-sm text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sign out</button>
   </form>
 </nav>
-<h1>Library</h1>
+
+<h1 class="text-2xl font-semibold tracking-tight mb-6">Library</h1>
 
 {% match message %}
   {% when Some with (msg) %}
-    <p class="error">{{ msg }}</p>
+    <div class="mb-4 px-4 py-3 rounded-lg bg-blue-50 border border-blue-200 text-blue-900 dark:bg-blue-950 dark:border-blue-900 dark:text-blue-200 text-sm">{{ msg }}</div>
   {% when None %}
 {% endmatch %}
 
-<h2>Save work to library</h2>
-<form method="post" action="/admin/library/add">
-  <label>Source
-    <select name="source" required>
-      <option value="imslp">IMSLP</option>
-      <option value="mutopia">Mutopia Project</option>
-      <option value="musescore">MuseScore</option>
-    </select>
-  </label>
-  <label>Item id
-    <input type="text" name="item_id" placeholder="e.g. Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric) for IMSLP" required>
-  </label>
-  <label>Title
-    <input type="text" name="title" placeholder="Display title for the library" required>
-  </label>
-  <button type="submit">Fetch and save</button>
-</form>
+<section class="mb-8 p-4 rounded-lg border border-gray-200 dark:border-gray-800">
+  <h2 class="text-base font-medium mb-3">Save work to library</h2>
+  <form method="post" action="/admin/library/add" class="space-y-3">
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      Source
+      <select name="source" required class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500">
+        <option value="imslp">IMSLP</option>
+        <option value="mutopia">Mutopia Project</option>
+        <option value="musescore">MuseScore</option>
+      </select>
+    </label>
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      Item id
+      <input type="text" name="item_id" placeholder="e.g. Nocturnes,_Op.9_(Chopin,_Fr%C3%A9d%C3%A9ric) for IMSLP" required class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+    </label>
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      Title
+      <input type="text" name="title" placeholder="Display title for the library" required class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500">
+    </label>
+    <button type="submit" class="inline-flex items-center px-4 py-2 rounded-md bg-gray-900 text-white hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white font-medium text-sm transition-colors">Fetch and save</button>
+  </form>
+</section>
 
-<h2>Existing items ({{ items.len() }})</h2>
+<h2 class="text-base font-medium mb-3">Existing items ({{ items.len() }})</h2>
 {% if items.is_empty() %}
-  <p>Library is empty.</p>
+  <p class="text-sm text-gray-500 dark:text-gray-400">Library is empty.</p>
 {% else %}
-  <table>
-    <thead><tr><th>Title</th><th>Size</th><th>Added</th></tr></thead>
-    <tbody>
-      {% for item in items %}
+  <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800">
+    <table class="min-w-full text-sm">
+      <thead class="bg-gray-50 dark:bg-gray-900 text-gray-600 dark:text-gray-400 text-left">
         <tr>
-          <td>{{ item.title }}</td>
-          <td>{{ item.size_bytes }} B</td>
-          <td>{{ item.added_at }}</td>
+          <th class="px-3 py-2 font-medium">Title</th>
+          <th class="px-3 py-2 font-medium">Size</th>
+          <th class="px-3 py-2 font-medium">Added</th>
         </tr>
-      {% endfor %}
-    </tbody>
-  </table>
+      </thead>
+      <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+        {% for item in items %}
+          <tr>
+            <td class="px-3 py-2 font-medium">{{ item.title }}</td>
+            <td class="px-3 py-2 text-gray-500 dark:text-gray-400 font-mono">{{ item.size_bytes }} B</td>
+            <td class="px-3 py-2 text-gray-500 dark:text-gray-400 font-mono text-xs">{{ item.added_at }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
 {% endif %}
 {% endblock %}

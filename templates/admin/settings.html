@@ -1,51 +1,85 @@
 {% extends "base.html" %}
 {% block title %}Settings &mdash; sheet-music-browsarr{% endblock %}
 {% block content %}
-<nav>
-  <a href="/">Search</a>
-  <a href="/admin">Admin</a>
-  <a href="/admin/library">Library</a>
-  <a href="/admin/settings">Settings</a>
-  <form method="post" action="/logout" class="inline">
-    <button type="submit">Sign out</button>
+<nav class="flex items-center gap-4 text-sm border-b border-gray-200 dark:border-gray-800 pb-3 mb-6">
+  <a href="/" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Search</a>
+  <a href="/admin" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Admin</a>
+  <a href="/admin/library" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Library</a>
+  <a href="/admin/settings" class="text-gray-900 dark:text-gray-100 font-medium">Settings</a>
+  <form method="post" action="/logout" class="ml-auto">
+    <button type="submit" class="text-sm text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sign out</button>
   </form>
 </nav>
-<h1>Settings</h1>
+
+<h1 class="text-2xl font-semibold tracking-tight mb-6">Settings</h1>
 
 {% match message %}
   {% when Some with (msg) %}
-    <p class="error">{{ msg }}</p>
+    <div class="mb-4 px-4 py-3 rounded-lg bg-blue-50 border border-blue-200 text-blue-900 dark:bg-blue-950 dark:border-blue-900 dark:text-blue-200 text-sm">{{ msg }}</div>
   {% when None %}
 {% endmatch %}
 
-<form method="post" action="/admin/settings">
-  <h2>Cloudflare Turnstile</h2>
-  <p>Generate a site key + secret key at <a href="https://dash.cloudflare.com/?to=/:account/turnstile" target="_blank" rel="noopener">dash.cloudflare.com/?to=/:account/turnstile</a>. Add <code>music.&lt;your-domain&gt;</code> as the allowed hostname.</p>
-  <label>Site key
-    <input type="text" name="turnstile_site_key" value="{{ turnstile_site_key }}" autocomplete="off">
-  </label>
-  <label>Secret key {% if turnstile_secret_set %}<small>(currently set &mdash; leave blank to keep)</small>{% endif %}
-    <input type="password" name="turnstile_secret_key" autocomplete="off" placeholder="{% if turnstile_secret_set %}**********{% else %}not set{% endif %}">
-  </label>
+<form method="post" action="/admin/settings" class="space-y-8">
 
-  <h2>SMTP</h2>
-  <p>For Gmail, use <code>smtp.gmail.com</code> port <code>587</code> with an app password. The "from" address must match the SMTP user.</p>
-  <label>Host
-    <input type="text" name="smtp_host" value="{{ smtp_host }}" placeholder="smtp.gmail.com" autocomplete="off">
-  </label>
-  <label>Port
-    <input type="number" name="smtp_port" value="{{ smtp_port }}" placeholder="587" autocomplete="off">
-  </label>
-  <label>User
-    <input type="text" name="smtp_user" value="{{ smtp_user }}" placeholder="you@gmail.com" autocomplete="off">
-  </label>
-  <label>Password {% if smtp_pass_set %}<small>(currently set &mdash; leave blank to keep)</small>{% endif %}
-    <input type="password" name="smtp_pass" autocomplete="new-password" placeholder="{% if smtp_pass_set %}**********{% else %}not set{% endif %}">
-  </label>
-  <label>From address
-    <input type="email" name="smtp_from" value="{{ smtp_from }}" placeholder="you@gmail.com" autocomplete="off">
-  </label>
+  <section class="p-4 rounded-lg border border-gray-200 dark:border-gray-800 space-y-3">
+    <div>
+      <h2 class="text-base font-medium">Cloudflare Turnstile</h2>
+      <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+        Generate keys at
+        <a href="https://dash.cloudflare.com/?to=/:account/turnstile" target="_blank" rel="noopener" class="text-blue-600 dark:text-blue-400 hover:underline">Cloudflare Zero Trust &rarr; Turnstile</a>.
+        Add <code class="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 font-mono text-xs">music.&lt;your-domain&gt;</code> as the allowed hostname.
+      </p>
+    </div>
 
-  <button type="submit">Save</button>
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      Site key
+      <input type="text" name="turnstile_site_key" value="{{ turnstile_site_key }}" autocomplete="off" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+    </label>
+
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      Secret key
+      {% if turnstile_secret_set %}<span class="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400">currently set &mdash; leave blank to keep</span>{% endif %}
+      <input type="password" name="turnstile_secret_key" autocomplete="off" placeholder="{% if turnstile_secret_set %}**********{% else %}not set{% endif %}" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+    </label>
+  </section>
+
+  <section class="p-4 rounded-lg border border-gray-200 dark:border-gray-800 space-y-3">
+    <div>
+      <h2 class="text-base font-medium">SMTP</h2>
+      <p class="mt-1 text-sm text-gray-500 dark:text-gray-400">
+        For Gmail use <code class="px-1 py-0.5 rounded bg-gray-100 dark:bg-gray-800 font-mono text-xs">smtp.gmail.com:587</code> with an app password.
+        The from address must match the SMTP user.
+      </p>
+    </div>
+
+    <div class="grid sm:grid-cols-2 gap-3">
+      <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+        Host
+        <input type="text" name="smtp_host" value="{{ smtp_host }}" placeholder="smtp.gmail.com" autocomplete="off" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+      </label>
+      <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+        Port
+        <input type="number" name="smtp_port" value="{{ smtp_port }}" placeholder="587" autocomplete="off" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+      </label>
+    </div>
+
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      User
+      <input type="text" name="smtp_user" value="{{ smtp_user }}" placeholder="you@gmail.com" autocomplete="off" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+    </label>
+
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      Password
+      {% if smtp_pass_set %}<span class="ml-2 text-xs font-normal text-gray-500 dark:text-gray-400">currently set &mdash; leave blank to keep</span>{% endif %}
+      <input type="password" name="smtp_pass" autocomplete="new-password" placeholder="{% if smtp_pass_set %}**********{% else %}not set{% endif %}" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+    </label>
+
+    <label class="block text-sm font-medium text-gray-700 dark:text-gray-300">
+      From address
+      <input type="email" name="smtp_from" value="{{ smtp_from }}" placeholder="you@gmail.com" autocomplete="off" class="mt-1 w-full text-sm px-3 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono">
+    </label>
+  </section>
+
+  <button type="submit" class="inline-flex items-center px-4 py-2 rounded-md bg-gray-900 text-white hover:bg-gray-800 dark:bg-gray-100 dark:text-gray-900 dark:hover:bg-white font-medium text-sm transition-colors">Save</button>
 </form>
 {% endblock %}

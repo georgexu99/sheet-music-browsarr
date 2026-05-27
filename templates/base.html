@@ -1,37 +1,14 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" class="h-full">
 <head>
   <meta charset="utf-8">
   <title>{% block title %}sheet-music-browsarr{% endblock %}</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <style>
-    body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #111; }
-    h1 { font-size: 1.5rem; margin-top: 0; }
-    nav { display: flex; gap: 1rem; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #e5e7eb; }
-    nav a { color: #1f2937; text-decoration: none; }
-    nav a:hover { text-decoration: underline; }
-    .error { color: #b91c1c; }
-    label { display: block; margin: 0.75rem 0; }
-    input { font-size: 1rem; padding: 0.5rem; width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 4px; }
-    button { font-size: 1rem; padding: 0.5rem 1rem; background: #1f2937; color: white; border: 0; border-radius: 4px; cursor: pointer; }
-    button:hover { background: #111827; }
-    form.inline { display: inline; }
-    form.inline button { background: transparent; color: #1f2937; padding: 0; }
-    form.inline button:hover { text-decoration: underline; background: transparent; }
-    .htmx-indicator { opacity: 0; transition: opacity 150ms ease-in; color: #6b7280; font-size: 0.9rem; margin-left: 0.5rem; }
-    .htmx-request .htmx-indicator { opacity: 1; }
-    .htmx-request.htmx-indicator { opacity: 1; }
-    .source-badge { color: #6b7280; font-size: 0.85rem; font-weight: normal; }
-    ul.results { list-style: none; padding: 0; }
-    li.result { padding: 0.75rem 0; border-bottom: 1px solid #f3f4f6; }
-    li.result .title { font-weight: 600; }
-    li.result .desc { color: #4b5563; font-size: 0.9rem; margin: 0.25rem 0; }
-    li.result .links { font-size: 0.9rem; }
-    details.email-form { margin-top: 0.5rem; }
-    details.email-form summary { cursor: pointer; color: #1f2937; font-size: 0.9rem; }
-  </style>
+  <link rel="stylesheet" href="/static/app.css">
 </head>
-<body>
-  {% block content %}{% endblock %}
+<body class="min-h-full bg-white text-gray-900 dark:bg-gray-950 dark:text-gray-100 antialiased font-sans">
+  <main class="max-w-3xl mx-auto px-4 py-8">
+    {% block content %}{% endblock %}
+  </main>
 </body>
 </html>
