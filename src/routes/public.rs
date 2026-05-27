@@ -506,11 +506,33 @@ async fn search(
     // Cross-product: (source, variant) -> one parallel search future.
     // Failing futures get a logged warn + empty Vec; nothing poisons the
     // whole search.
+    //
+    // Exception: MuseScore only gets the user's original query, never
+    // the CJK variant expansions. Reasoning:
+    //   - MuseScore.com sits behind Cloudflare; we go through
+    //     FlareSolverr, where each call spins up (or queues against)
+    //     a headless Chromium that takes ~5–30 s.
+    //   - 4 variants × MuseScore = 4 parallel FS calls per query,
+    //     which routinely overflows FS's internal queue (depths of
+    //     8–12) and trips timeouts.
+    //   - MuseScore's catalog is overwhelmingly English-titled
+    //     community uploads — the CJK variants find very few extra
+    //     hits there relative to the load they generate. IMSLP and
+    //     Mutopia (cheap HTTP fetches, multilingual catalogs) keep
+    //     the full variant fan-out.
+    let original_query = query.clone();
     let pairs: Vec<(Arc<dyn Source>, String)> = selected_sources
         .iter()
         .flat_map(|s| {
             let src = s.clone();
-            variants.iter().map(move |v| (src.clone(), v.clone()))
+            if src.id() == "musescore" {
+                vec![(src, original_query.clone())]
+            } else {
+                variants
+                    .iter()
+                    .map(|v| (src.clone(), v.clone()))
+                    .collect::<Vec<_>>()
+            }
         })
         .collect();
     let search_cache: SearchCache = state.search_cache.clone();

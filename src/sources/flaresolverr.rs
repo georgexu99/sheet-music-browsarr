@@ -27,19 +27,17 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Wall-clock cap on the FlareSolverr HTTP call itself. With sessions
-/// enabled (see `create_session`) the per-request cost should be a
-/// few seconds — only the first call pays the Chromium-cold-start
-/// tax. 25 s is the trade-off: long enough to absorb a one-off slow
-/// solve, short enough that a wedged FS doesn't make users wait a
-/// full minute before falling back. The previous 60 s was hiding
-/// FS-broken states behind a long spinner.
-const FS_TIMEOUT: Duration = Duration::from_secs(25);
+/// Wall-clock cap on the FlareSolverr HTTP call itself. Observed FS
+/// solve times under modest load: 5–30 s with sessions, 30–60 s
+/// without. 45 s threads the needle: enough headroom for a slow
+/// solve to land, but short enough that a truly wedged FS surfaces
+/// as a failure within a minute rather than dragging out a search.
+const FS_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// `maxTimeout` field passed to FlareSolverr — the budget *it* applies to
 /// solving the challenge. Match the HTTP-side timeout so the failure
 /// mode is a single clean error rather than a layered double-timeout.
-const FS_MAX_TIMEOUT_MS: u64 = 25_000;
+const FS_MAX_TIMEOUT_MS: u64 = 45_000;
 
 #[derive(Clone)]
 pub struct FlareSolverr {
