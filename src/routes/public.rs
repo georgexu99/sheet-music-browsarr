@@ -35,11 +35,6 @@ const APP_CSS: &str = include_str!("../../dist/styles.css");
 /// Typeahead: ignore queries shorter than this. Avoids 1-char query storms
 /// while users are still typing the start of a name.
 const SEARCH_MIN_QUERY_LEN: usize = 2;
-/// Browser-side TTL for search responses. Re-typing the same query within
-/// this window hits the browser HTTP cache instead of round-tripping. Sized
-/// per the typeahead playbook (cache is stable enough for catalog content,
-/// new items still surface within a minute).
-const SEARCH_CACHE_TTL_SECS: u32 = 60;
 
 #[derive(Template)]
 #[template(path = "search.html")]
@@ -209,16 +204,14 @@ async fn search(
     )
     .await;
 
-    let mut response = render_results(is_htmx, &query, results, site_key).into_response();
-    // Browser HTTP cache: re-typing the same query within the TTL serves
-    // from cache, no upstream re-hit. Same per-query response for any
-    // anonymous visitor, so `public` is correct.
-    if let Ok(v) = HeaderValue::from_str(&format!(
-        "public, max-age={SEARCH_CACHE_TTL_SECS}"
-    )) {
-        response.headers_mut().insert(header::CACHE_CONTROL, v);
-    }
-    response
+    // No Cache-Control header on /search responses. The same URL serves
+    // two different shapes (HTMX partial vs full page on native nav) and
+    // browsers cache by URL only, so caching causes a partial to be
+    // rendered as a full document after pressing Enter. The server-side
+    // moka cache (`src/cache.rs`) already absorbs cross-user repeat
+    // queries; the browser-side cache would only deduplicate same-user
+    // self-repeat which isn't worth the partial-vs-full collision.
+    render_results(is_htmx, &query, results, site_key).into_response()
 }
 
 fn render_results(
