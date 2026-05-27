@@ -7,11 +7,17 @@ use futures_util::StreamExt;
 use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, XObjectTransform};
 use reqwest::cookie::Jar;
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
+use super::flaresolverr::{FlareSolverr, FsSolution};
 use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
+
+/// Env var name. When set, MuseScore's Cloudflare-challenged GETs go
+/// through FlareSolverr (the score-page and the /sheetmusic search page).
+/// Bundle JS, /api/jmuse, and CDN PNG fetches stay direct.
+const FLARESOLVERR_ENV: &str = "FLARESOLVERR_URL";
 
 // MuseScore.com sits behind Cloudflare; stale or obvious-bot UAs get the
 // "Just a moment…" challenge page (HTTP 403). The full set of headers a
@@ -83,13 +89,16 @@ fn nav_headers() -> [(HeaderName, HeaderValue); 6] {
 pub struct Musescore {
     http: Client,
     /// Shared cookie jar — anything Cloudflare hands us (`cf_clearance`,
-    /// `__cf_bm`, etc.) gets stashed here automatically and replayed on
-    /// subsequent requests. Wrapped in `Arc` so the FlareSolverr helper
-    /// (when configured — see Phase H) can inject cookies it harvests
-    /// from the challenge-solved response without needing a second client.
-    #[allow(dead_code)] // Currently passed only to Client::cookie_provider;
-                       // kept addressable for future cookie injection.
+    /// `__cf_bm`, etc.) gets stashed here automatically by reqwest on
+    /// direct fetches, and gets injected explicitly from FlareSolverr's
+    /// solution payload after a challenge-solved fetch. Either way the
+    /// cookies are replayed on subsequent direct calls (bundle JS,
+    /// /api/jmuse, CDN PNGs).
     jar: Arc<Jar>,
+    /// Optional FlareSolverr proxy. Some(_) when `FLARESOLVERR_URL` is
+    /// set at startup; None otherwise. `fetch_html_challenged()` routes
+    /// through it when present and falls back to direct otherwise.
+    fs: Option<FlareSolverr>,
     cached: Mutex<Option<CachedAlgorithm>>,
 }
 
@@ -130,30 +139,105 @@ impl Musescore {
             .default_headers(default_headers)
             .cookie_provider(jar.clone())
             .build()?;
+
+        // Opt-in FlareSolverr wiring. We log once at startup so the
+        // operator can confirm the env var was picked up; further FS
+        // failures are logged at the call site.
+        let fs = match std::env::var(FLARESOLVERR_ENV).ok().filter(|s| !s.is_empty()) {
+            Some(url) => {
+                tracing::info!(flaresolverr_url = %url, "MuseScore: routing CF-challenged requests through FlareSolverr");
+                Some(FlareSolverr::new(url).context("constructing FlareSolverr client")?)
+            }
+            None => {
+                tracing::debug!("MuseScore: FLARESOLVERR_URL unset; direct fetches only");
+                None
+            }
+        };
+
         Ok(Self {
             http,
             jar,
+            fs,
             cached: Mutex::new(None),
         })
+    }
+
+    /// Fetch a Cloudflare-challenged URL. Routes through FlareSolverr if
+    /// configured; falls back to a direct fetch otherwise. Cookies from
+    /// the FS response are injected into our shared jar so subsequent
+    /// direct fetches (bundle JS, /api/jmuse, CDN PNGs) carry the
+    /// `cf_clearance` if MuseScore expands CF coverage to those paths.
+    async fn fetch_html_challenged(&self, url: &str, ctx_label: &'static str) -> anyhow::Result<String> {
+        match &self.fs {
+            Some(fs) => {
+                let solution: FsSolution = fs.get(url).await.with_context(|| {
+                    format!("flaresolverr {ctx_label} {url}")
+                })?;
+                if solution.status >= 400 {
+                    anyhow::bail!(
+                        "flaresolverr {ctx_label} HTTP {}: {}",
+                        solution.status,
+                        truncate_for_log(&solution.response, 200)
+                    );
+                }
+                self.absorb_fs_cookies(&solution);
+                Ok(solution.response)
+            }
+            None => {
+                let mut req = self.http.get(url);
+                for (k, v) in nav_headers() {
+                    req = req.header(k, v);
+                }
+                let resp = req
+                    .send()
+                    .await
+                    .with_context(|| format!("musescore {ctx_label} request"))?;
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    let snippet = truncate_for_log(&body, 200);
+                    anyhow::bail!("musescore {ctx_label} HTTP {status}: {snippet}");
+                }
+                resp.text()
+                    .await
+                    .with_context(|| format!("musescore {ctx_label} body"))
+            }
+        }
+    }
+
+    /// Inject every cookie FlareSolverr captured back into our reqwest
+    /// cookie jar. Reqwest enforces domain / path / Secure scoping at
+    /// match-time, so we serialize each cookie as a Set-Cookie-style
+    /// string scoped to its own domain and let the jar do the right
+    /// thing for subsequent direct requests.
+    fn absorb_fs_cookies(&self, solution: &FsSolution) {
+        // `Jar::add_cookie_str` wants a URL whose scheme + host imply the
+        // cookie's domain. musescore.com (and its subdomains) is the only
+        // host we care about; if FS ever returns cookies for a different
+        // origin we'd be storing them too narrowly, but that's harmless.
+        let Ok(base) = Url::parse("https://musescore.com/") else {
+            return;
+        };
+        for c in &solution.cookies {
+            let path = if c.path.is_empty() { "/" } else { c.path.as_str() };
+            let secure = if c.secure { "; Secure" } else { "" };
+            // Strip a leading dot from the domain — `Set-Cookie: Domain=` may
+            // begin with one (RFC 6265 historical quirk) but reqwest's parser
+            // prefers it without.
+            let domain = c.domain.trim_start_matches('.');
+            let cookie_str = format!(
+                "{}={}; Domain={}; Path={}{}",
+                c.name, c.value, domain, path, secure
+            );
+            self.jar.add_cookie_str(&cookie_str, &base);
+        }
     }
 
     /// Fetch a score page and parse out the bundle URL plus the hydration
     /// JSON. Returns (bundle_url, score_meta).
     async fn fetch_score_page(&self, id: &str) -> anyhow::Result<(String, ScoreMeta)> {
         let url = format!("https://musescore.com/score/{id}");
-        let mut req = self.http.get(&url);
-        for (k, v) in nav_headers() {
-            req = req.header(k, v);
-        }
-        let html = req
-            .send()
-            .await
-            .context("musescore page fetch")?
-            .error_for_status()
-            .context("musescore page status")?
-            .text()
-            .await
-            .context("musescore page body")?;
+        let html = self.fetch_html_challenged(&url, "page").await?;
 
         let bundle_url = extract_bundle_url(&html)
             .ok_or_else(|| anyhow::anyhow!("could not find musescore bundle URL on {url}"))?;
@@ -359,22 +443,7 @@ impl Source for Musescore {
                 urlencoding::encode(query)
             ),
         };
-        let mut req = self.http.get(&url);
-        for (k, v) in nav_headers() {
-            req = req.header(k, v);
-        }
-        let resp = req.send().await.context("musescore search request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            // Pull a short body snippet for the log — MuseScore returns a
-            // recognisable bot-block / rate-limit page on failure, and
-            // without the status code we can't tell 403 from 429 from a
-            // layout change.
-            let body = resp.text().await.unwrap_or_default();
-            let snippet: String = body.chars().take(200).collect();
-            anyhow::bail!("musescore search HTTP {status}: {snippet}");
-        }
-        let html = resp.text().await.context("musescore search body")?;
+        let html = self.fetch_html_challenged(&url, "search").await?;
 
         let scores = match extract_search_scores(&html) {
             Some(s) => s,
@@ -822,6 +891,13 @@ fn find_hydration_json(html: &str) -> Option<String> {
 ///      `composer_name`) which MuseScore stores in HTML-encoded form.
 fn html_unescape(s: &str) -> String {
     html_escape::decode_html_entities(s).into_owned()
+}
+
+/// Bound an error-log snippet to `max` Unicode characters. Used when
+/// quoting upstream response bodies in `bail!` messages so a 4 MB
+/// Cloudflare challenge page doesn't flood the logs.
+fn truncate_for_log(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 fn extract_score_meta(html: &str) -> Option<ScoreMeta> {

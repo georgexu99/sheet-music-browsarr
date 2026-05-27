@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use serde::Serialize;
 
+pub mod flaresolverr;
 pub mod health;
 pub mod imslp;
 pub mod musescore;
