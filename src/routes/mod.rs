@@ -14,6 +14,12 @@ pub mod public;
 pub struct AppState {
     pub pool: SqlitePool,
     pub sources: Vec<Arc<dyn Source>>,
+    /// AES-GCM encryptor for at-rest secrets. Unused since the email
+    /// feature was removed (Turnstile + SMTP creds were the only
+    /// consumers), but the helpers stay around as scaffolding for the
+    /// next admin-configurable setting that needs secret-at-rest storage
+    /// (e.g., Whatbox creds for the deferred Phase 5 work).
+    #[allow(dead_code)]
     pub secrets: Secrets,
     pub search_cache: SearchCache,
     /// Resolved-thumbnail URL cache for sources that need a lazy lookup

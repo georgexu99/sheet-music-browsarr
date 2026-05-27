@@ -56,8 +56,10 @@ struct FsEnvelope {
 /// Fields we don't need (headers, response_url metadata) are dropped.
 #[derive(Debug, Deserialize)]
 pub struct FsSolution {
-    /// Final URL after any redirects FS followed.
+    /// Final URL after any redirects FS followed. Kept on the struct
+    /// for diagnostics even though no current caller reads it.
     #[serde(default)]
+    #[allow(dead_code)]
     pub url: String,
     /// HTTP status code of the upstream response, post-challenge.
     pub status: u16,
@@ -65,8 +67,10 @@ pub struct FsSolution {
     pub response: String,
     /// The UA FlareSolverr's bundled Chromium used. Callers replaying
     /// `cf_clearance` on direct fetches MUST set this same UA, since
-    /// Cloudflare binds the cookie to (IP, UA).
+    /// Cloudflare binds the cookie to (IP, UA). Not yet honoured by
+    /// the MuseScore source — kept here for the future fix.
     #[serde(rename = "userAgent")]
+    #[allow(dead_code)]
     pub user_agent: String,
     /// All cookies the upstream set during the resolved navigation,
     /// including `cf_clearance` and `__cf_bm`.
@@ -87,6 +91,7 @@ pub struct FsCookie {
     /// don't enforce it ourselves — the reqwest cookie jar handles
     /// expiry. Field kept for diagnostic logging only.
     #[serde(default)]
+    #[allow(dead_code)]
     pub expires: f64,
 }
 

@@ -1191,6 +1191,23 @@ mod tests {
     #[ignore]
     async fn musescore_smoke_search_and_fetch_pdf() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+
+        // MuseScore.com sits behind Cloudflare's bot challenge now; direct
+        // fetches return HTTP 403 with the "Just a moment…" interstitial.
+        // The whole pipeline only works when FLARESOLVERR_URL is set so the
+        // CF-challenged pages route through a real browser. The GitHub
+        // Actions runner doesn't have FS provisioned, so skip there rather
+        // than fail loudly — the test is still runnable locally / on the
+        // NAS where FS lives. To run the smoke against FS in CI, add a
+        // service container to .github/workflows/release.yml.
+        if std::env::var("FLARESOLVERR_URL").ok().filter(|s| !s.is_empty()).is_none() {
+            eprintln!(
+                "musescore_smoke: FLARESOLVERR_URL not set, skipping; \
+                 see comment for how to enable in CI"
+            );
+            return;
+        }
+
         let m = Musescore::new().expect("Musescore::new");
 
         let query =

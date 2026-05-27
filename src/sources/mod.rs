@@ -143,6 +143,7 @@ pub struct MetadataBadge {
 /// the source extractors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)] // Key/Difficulty kept for sources that can extract them later.
 pub enum BadgeKind {
     Pages,
     Key,

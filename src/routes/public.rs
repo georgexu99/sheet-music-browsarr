@@ -9,7 +9,6 @@ use axum::routing::{get, post};
 use axum::{Form, Router};
 use futures_util::future::join_all;
 use serde::Deserialize;
-use sqlx::SqlitePool;
 use tower_sessions::Session;
 
 use crate::audit;

@@ -11,11 +11,17 @@ use sha2::Sha256;
 /// table marked `encrypted=1` is decryptable only with that env var.
 ///
 /// Format on disk: base64( nonce(12) || ciphertext+tag ).
+///
+/// Currently unused (the email-feature removal took out the only consumers —
+/// Turnstile + SMTP creds), but the module stays around as scaffolding for the
+/// next admin-configurable setting that needs secret-at-rest storage.
+#[allow(dead_code)]
 #[derive(Clone)]
 pub struct Secrets {
     cipher: Aes256Gcm,
 }
 
+#[allow(dead_code)]
 impl Secrets {
     pub fn new(env_key: &str) -> anyhow::Result<Self> {
         anyhow::ensure!(
