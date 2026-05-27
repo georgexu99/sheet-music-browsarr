@@ -23,6 +23,20 @@
  * when the dynamic class doesn't show up as a literal. */
 @source inline("{source-badge,source-badge-imslp,source-badge-mutopia,source-badge-musescore}");
 
+/* Belt-and-suspenders: force-include the dark-mode utility set the
+ * layout actually uses. The theme toggle in base.html flips a `dark`
+ * class on <html>; that does nothing visible unless every `dark:*`
+ * utility class in our markup also exists in the compiled stylesheet.
+ * Listing them inline here makes the toggle work even if Tailwind's
+ * content-scan misses a template file. Brace expansion is one literal
+ * per nested arm — Tailwind v4 expands `{a,b}-{x,y}` to four classes. */
+@source inline("{,dark:}{bg,text,border}-{white,gray-50,gray-100,gray-200,gray-300,gray-400,gray-500,gray-600,gray-700,gray-800,gray-900,gray-950}");
+@source inline("{,dark:}hover:{bg,text,border}-{gray-50,gray-100,gray-200,gray-300,gray-400,gray-500,gray-700,gray-800,gray-900,gray-100}");
+@source inline("dark:{block,hidden}");
+@source inline("dark:peer-checked:{bg,text,border}-{gray-100,gray-900,gray-50}");
+@source inline("{,dark:}{bg,text}-{blue,emerald,orange,amber,red}-{50,100,200,800,900,950}");
+@source inline("{,dark:}border-{amber,blue,emerald,orange}-{200,900,950}");
+
 @theme {
   /* Inter as the primary face. Lands a noticeably tighter look than the
    * system-font stack on Windows/Linux, and matches what Mac users with
