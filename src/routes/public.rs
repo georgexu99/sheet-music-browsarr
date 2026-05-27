@@ -387,13 +387,20 @@ async fn search(
                     rs
                 }
                 Err(e) => {
+                    // `{:#}` flattens an anyhow chain into a single
+                    // colon-separated line, which keeps the structured
+                    // log readable while still surfacing the underlying
+                    // cause ("flaresolverr search …: flaresolverr
+                    // returned status=error message=…: …" instead of
+                    // just "flaresolverr search …").
+                    let chain = format!("{:#}", e);
                     tracing::warn!(
                         source = src.id(),
                         variant = %v,
-                        error = %e,
+                        error = %chain,
                         "source search failed"
                     );
-                    health::record_err(&health, src.id(), &e.to_string());
+                    health::record_err(&health, src.id(), &chain);
                     Vec::new()
                 }
             }

@@ -448,8 +448,23 @@ impl Source for Musescore {
         let scores = match extract_search_scores(&html) {
             Some(s) => s,
             None => {
+                // Hydration JSON not found. Two common causes:
+                //   1. FlareSolverr returned the challenge interstitial
+                //      ("Just a moment…") instead of the post-challenge
+                //      content — i.e. FS thinks it solved but didn't.
+                //   2. MuseScore changed their SSR hydration format.
+                // Log a clamped snippet + a quick "looks like CF" sniff
+                // so we can tell the two apart without enabling
+                // FlareSolverr's LOG_HTML.
+                let snippet = truncate_for_log(&html, 400);
+                let looks_like_cf = html.contains("Just a moment")
+                    || html.contains("challenge-platform")
+                    || html.contains("cf-mitigated");
                 tracing::warn!(
-                    "musescore search hydration not found; site layout may have changed"
+                    bytes = html.len(),
+                    looks_like_cf,
+                    snippet = %snippet,
+                    "musescore search hydration not found; site layout may have changed (or FS didn't clear CF)"
                 );
                 return Ok(Vec::new());
             }
