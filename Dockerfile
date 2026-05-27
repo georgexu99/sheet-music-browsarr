@@ -14,6 +14,7 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
 COPY src ./src
 COPY migrations ./migrations
 COPY templates ./templates
+COPY assets ./assets
 RUN cargo build --release && \
     strip target/release/sheet-music-browsarr || true
 
