@@ -311,6 +311,73 @@ CREATE TABLE admin_user (
 1. **Search**: query `https://imslp.org/api.php?action=opensearch&search=...&format=json` for autocomplete results, then `action=parse` to enrich. Fall back to scraping the search page with `scraper` crate when API is insufficient.
 2. **PDF fetch**: results link to Petrucci library URLs like `https://imslp.org/wiki/Special:ImagefromIndex/<id>/...`. GET → either stream to the user (public download) or write to `/library` (admin add-to-library).
 
+### MuseScore (added during build)
+
+MuseScore.com is a community-uploaded sheet-music site. Free uploads have no server-side PDF (`is_pdf == 0`); we have to reconstruct the PDF ourselves from per-page PNG renderings the site serves via a token-gated API. The technique is a server-side port of the `musescore-downloader` browser extension — fragile by design but the only path that returns inline PDFs without paying for MuseScore Pro.
+
+#### Search → click flow
+
+User types a query → `/search` fan-out hits `Musescore::search` with each i18n variant → MuseScore page returns HTML with embedded hydration JSON → we parse the `scores` array (id, title, composer_name, thumbnail_url, href) → results merged with IMSLP + Mutopia, deduped by `(source, id)`, rendered as cards.
+
+User clicks "Open PDF" on a MuseScore card → browser GETs `/pdf/musescore/{score_id}` → `pdf_handler` (`src/routes/public.rs`) dispatches to `Musescore::fetch_pdf_bytes(score_id, MAX_PDF_BYTES)` → on success: inline PDF with `Content-Type: application/pdf` + `Content-Disposition: inline; filename="{id}.pdf"`. On any failure: silent 302 to `https://musescore.com/score/{id}` (Phase G replaces this with an inline failure page that lets the user choose).
+
+#### `fetch_pdf_bytes` pipeline (5 stages)
+
+1. **Score page fetch** — GET `https://musescore.com/score/{id}`. Extract:
+   - **Bundle URL** via `extract_bundle_url`. Looks for `<link rel="preload" as="script" href="…/static/public/build/…/<digits>.<hash>.js">`. Helper `matches_bundle_pattern` filters out `ms.<hash>.js` and `vendor.<hash>.js`.
+   - **Score meta** (`pages_count`, etc.) via hydration JSON.
+
+2. **Bundle prepare** — `prepare_algorithm(bundle_url)`. Cached by `bundle_url` in a `Mutex<Option<CachedAlgorithm>>` — bundle URLs embed a content hash, so a single cache slot is enough and invalidates automatically on MuseScore deploys. Fetches ~0.5 MB of minified JS and rewrites it via three textual substitutions:
+   - `find_random_token` — regex over the bundle finding the literal `"<salt>".substr(0, 4)` to extract the per-deploy `randomToken` salt.
+   - `find_md5_module_id` — scans for `_digestsize` / `_blocksize` (pycryptodome-style literals) then walks backwards to a webpack module header `, <id>: function(` or `, <id>: (`. The id locates the MD5 module among hundreds in the bundle.
+   - Three rewrites — `replace_webpack_header`, `replace_closing_paren`, `replace_exports_with_window` — turn the MD5 module's `module.exports` into a globally-callable `window.generateToken`.
+
+3. **Per-page token mint + jmuse URL resolve** (serial). For each `index in 0..pages_count`:
+   - `mint_token`: `tokio::task::spawn_blocking` constructs a `boa_engine::Context`, evals `var window = {};` then the rewritten bundle, calls `window.generateToken(score_id + "img" + index + random_token)`, takes `.substring(0, 4)` for the 4-char Authorization token.
+   - `jmuse_url`: GET `/api/jmuse?id={score_id}&index={index}&type=img` with `Authorization: {token}` and `Referer: {external_url}`. Response is JSON `{result: "success", info: {url: <cdn_url>}}`. The CDN URL points at a per-page PNG.
+   - Comment at the loop notes: "musescore's per-IP rate limit on /api/jmuse is hair-trigger; serial keeps the failure modes predictable" — parallelizing here is left for later (a `buffer_unordered(4)` would give a ~4× speedup but only worth attempting after the pipeline is reliable).
+
+4. **PNG fetch** (serial). Each CDN URL is fetched through `fetch_bytes(url, per_page_budget)` with a streaming size cap. Aggregate cap: `running` bytes must not exceed `max_bytes` across all pages.
+
+5. **PDF assembly** — `tokio::task::spawn_blocking(|| assemble_pdf(&pngs))`. For each PNG: `printpdf::RawImage::decode_from_bytes`, derive page size from pixel dimensions at 96 DPI, create a `PdfPage` containing an `Op::UseXobject` for the image. Save with `PdfSaveOptions::default()`. Final size-cap check then `Ok(Vec<u8>)`.
+
+#### Callers of `fetch_pdf_bytes`
+
+Same method is invoked from three places with different size caps — any cache or fallback change must be coherent across all three:
+
+- **`/pdf/musescore/{id}`** — public, `MAX_PDF_BYTES = 10 MB` (`src/routes/public.rs`). Inline PDF served to the browser; 302 fallback on error.
+- **`/email`** — public, same 10 MB cap. PDF attached to the outbound SMTP message; Turnstile + rate-limit gated.
+- **`/admin/library/add`** — admin-only, `ADMIN_MAX_PDF_BYTES = 25 MB` (`src/routes/admin.rs`). Result written to `/library/{title}.pdf` + DB rows in `queue_items` + `library_items`.
+
+#### Failure modes by stage
+
+The status-code surfacing fix (commit `f343096`) makes every failure carry the actual HTTP code + a 200-char body snippet. Maps to the reliability roadmap (next section):
+
+| Stage | Symptom in logs | Likely cause | Roadmap phase |
+|---|---|---|---|
+| Search | `musescore search HTTP 403: <Cloudflare HTML>` | Cloudflare bot-block | **B** (browser headers) → **C** (FlareSolverr) |
+| Search | `musescore search HTTP 429` | Rate limit (4× i18n fan-out amplifies) | Bump moka TTL for MuseScore |
+| Search | `musescore search hydration not found` | MuseScore changed HTML layout | Update `find_hydration_json` |
+| Score page | `could not find musescore bundle URL on …` | Preload tag moved | Update `matches_bundle_pattern` |
+| Bundle prepare | `randomToken salt not found in bundle` | `substr(0, 4)` site restructured | **E** (regex update) |
+| Bundle prepare | `MD5 module not found in bundle` | `_digestsize` literal gone or webpack header changed | **E** — fallback: drop boa, use Rust `md-5` crate directly with the extracted salt |
+| Token mint | `window.generateToken missing` | Rewrite didn't produce expected global | **E** |
+| jmuse | `musescore jmuse error: …` | Token rejected by server | Wrong formula (`id+type+index+salt`) or Pro-only content |
+| PNG fetch | non-2xx | CDN gated; same Cloudflare path as search | **B/C** |
+| PDF assembly | `bytes don't start with %PDF-1.` | printpdf re-encode regression | **E** (verify passthrough) |
+| Whole pipeline | every "Open PDF" silently 302s | No successful click yet — pipeline could be entirely broken | Phase D smoke test surfaces which stage |
+
+#### Caches involved
+
+- `cache.rs` moka **search** cache — keyed by `(source_id, query_variant)`, 60 s TTL, 1000-entry LRU. Hits count as "ok" for `SourceHealth` (recent fresh response is good liveness signal).
+- `Musescore.cached: Mutex<Option<CachedAlgorithm>>` — one slot for the prepared (rewritten) bundle keyed by `bundle_url`. Reused for every page of every subsequent score until MuseScore deploys a new bundle.
+- `cache.rs` moka **`ThumbnailCache`** — 24 h TTL, 5000-entry cap. Used by IMSLP's lazy `/thumbnail/{source}/{id}` route; MuseScore's `thumbnail_url` is already in the search hydration so no lazy lookup needed.
+- **Planned (Phase F)** — on-disk PDF cache at `/cache/musescore/{cache_version}/{id}-{bundle_hash_prefix}.pdf`. Bundle-hash-keyed so MuseScore deploys auto-invalidate. `cache_version` bumped when the rewriter changes. Atomic `.tmp` + rename. Separate `/cache` volume so admins can `rm -rf` without touching `/config`.
+
+#### Source health surfacing (Phase G.0 — shipped)
+
+`src/sources/health.rs`. In-memory `Arc<HashMap<&'static str, RwLock<SourceHealth>>>` map built once in `main.rs`. `record_ok` / `record_err` called inside the search fan-out and inside `pdf_handler` after `fetch_pdf_bytes`. `is_degraded()` returns true when `consecutive_fails >= 4` (one full i18n fan-out worth of failures). `/admin/sources` (`templates/admin/sources.html`) renders the live snapshot plus an audit-log-backed table of per-source `pdf` and `library_add` outcomes — durable history complementing the volatile in-memory map.
+
 ### Torznab indexers (native)
 
 Each indexer = `(name, url, api_key, categories)`. Search worker:
@@ -505,11 +572,97 @@ These pieces weren't on the original phasing but landed during build-out. Listed
 
 - **Multi-source refactor.** `src/sources/mod.rs` defines an async `Source` trait (`id`, `display_name`, `external_url`, `search`, `fetch_pdf_bytes`); `AppState` holds `Vec<Arc<dyn Source>>`; the search and PDF routes generalise on a `source_id` path-param. New sources are drop-in additions.
 - **Mutopia source.** Scrapes the classic CGI search HTML; base64-encodes the direct PDF URL as the public id so single-segment path params stay clean.
-- **MuseScore source.** Server-side port of the `musescore-downloader` browser extension's technique: fetch a score page → extract the webpack bundle URL → download and parse the bundle → locate the MD5 module via `_digestsize`/`_blocksize` literals → surgically rewrite it into a callable `window.generateToken` → execute it in `boa_engine` (pure-Rust JS runtime, chosen over rquickjs to avoid the C-compiler dep) to mint per-request tokens → call `/api/jmuse` with the token → fetch per-page PNGs → stitch into a single PDF with `printpdf`. The prepared script is cached by bundle URL; only re-prepares on MuseScore deploys. Tradeoffs: fragile by design (the regex matches MuseScore's specific minified output), no direct server-side PDF available for free user uploads (hence the PNG-stitch approach).
+- **MuseScore source.** Server-side port of the `musescore-downloader` browser extension's technique; ~830 lines in `src/sources/musescore.rs`. Full pipeline reference + click flow in `## Source integrations` → `### MuseScore (added during build)` above. In-flight reliability work tracked in `## MuseScore reliability roadmap (Phases A→G)` below.
 - **Server-side search cache** (`moka`). Per `(source_id, query_variant)` tuple, 60 s TTL, 1000-entry LRU cap. Cross-user repeat queries hit memory; protects rate-limited upstreams (especially IMSLP, which our Phase 3 fan-out amplifies 4×).
 - **Typeahead UI patterns.** HTMX `hx-trigger="keyup changed delay:300ms"` for debounce, `hx-sync this:replace` for race-condition cancellation, `hx-indicator` for a fade-in "Searching…" affordance, 2-char minimum on the server, `Cache-Control: public, max-age=60` for browser caching. Patterns lifted from the Databricks FE-SYS typeahead playbook.
 - **CI → Portainer redeploy webhook.** `gh secret PORTAINER_WEBHOOK_URL` + a final `curl -X POST` step in `release.yml`. Push to main → build → publish to `ghcr.io` → POST webhook → Portainer pulls and recreates the container. `pull_policy: always` in compose makes the redeploy actually fetch fresh.
 - **IMSLP disclaimer handling.** Two-hop fetch: when the work-page scraper finds a `Special:ImagefromIndex/...` URL (disclaimer-gated), the source follows it once and scrapes the embedded CDN URL out of the disclaimer page itself. Pre-seeded `imslpdisclaim` accept cookie as a belt-and-suspenders. `Content-Type` check on the upstream response so HTML-disguised-as-PDF can't be served to the browser.
+
+---
+
+## MuseScore reliability roadmap (Phases A→G)
+
+Distinct from the original Phase 0–8 phasing; this is the in-flight effort to make MuseScore actually deliver inline PDFs reliably. Lives in its own section because (a) it spans search reliability and PDF delivery as a single feature, (b) several phases are conditional on what diagnostics reveal, and (c) the original implementer never smoke-tested end-to-end. Detailed working plan: `C:\Users\georg\.claude\plans\curious-frolicking-wave.md`.
+
+Phasing chosen to keep variables independent during diagnosis — don't change HTTP fingerprint before measuring what's broken, and don't blame the bundle rewriter until the fetch is unblocked.
+
+### Phase A — Diagnose (no code)
+
+1. **Audit-log triage** on the NAS:
+   ```sql
+   SELECT result, COUNT(*) FROM audit_log
+   WHERE action='pdf' AND target LIKE 'musescore/%'
+   GROUP BY result;
+   ```
+   All `fetch_failed_redirect` → PDF pipeline never worked in production (likely rewriter is stale). Any `ok` rows → pipeline did work; recent failures are search-side regression.
+2. **Fresh log capture** — one search post-redeploy of the status-code-surfacing fix captures the actual HTTP status (`403` / `429` / `200`+selector-miss).
+3. **Container-side curl** — `docker exec sheet-music-browsarr curl -v -H "User-Agent: …" 'https://musescore.com/sheetmusic?text=bach'`. If curl passes from the same IP and our reqwest doesn't, the gap is TLS/JA3 / HTTP/2 settings — FlareSolverr becomes the only path. Also check `Content-Encoding`: if `br`-only and we don't have the `brotli` reqwest feature, fetch returns garbage.
+
+### Phase G.0 — Health scaffold (SHIPPED — commit `368e7ee`)
+
+In-memory `SourceHealth` map (see Source integrations → "Source health surfacing") + `/admin/sources` page. Landed first as debugging infrastructure for the rest of the roadmap. No user-facing surface yet — that's Phase G.
+
+### Phase D — Smoke test scaffold (SHIPPED locally — commit `a0b75fb`, awaits push)
+
+`#[tokio::test] #[ignore]` at the bottom of `src/sources/musescore.rs` that exercises the whole pipeline against the live MuseScore site. CI runs it on every push (`musescore-smoke` job in `release.yml`) with `continue-on-error: true` so the inherently-flaky upstream never blocks deploy. Failure-mode mapping is documented inline so the panic message points at the right phase to fix. `MUSESCORE_SMOKE_QUERY` / `MUSESCORE_SMOKE_ID` env vars let us pin to a known-stable score.
+
+Run manually:
+```bash
+cargo test --ignored musescore_smoke -- --nocapture
+```
+Linux only — the Windows dev host doesn't have gcc to link boa.
+
+### Phase B — Browser-grade HTTP client + brotli
+
+Apply realistic browser headers + cookie jar to the `Musescore` reqwest client. Mirror the IMSLP pattern at `src/sources/imslp.rs`.
+
+- Add `"brotli"` to the reqwest features in `Cargo.toml` (MuseScore CDN often serves `br`-encoded responses; without the feature we get garbage).
+- Realistic UA — current Chrome on desktop. (A Mozilla/5.0 Win64 UA shipped in an earlier commit; round out with `Accept`, `Accept-Language: en-US,en;q=0.9`, `Sec-Ch-Ua-*`, `Sec-Fetch-Site: none`, `Sec-Fetch-Mode: navigate`, `Sec-Fetch-User: ?1`, `Sec-Fetch-Dest: document`.)
+- `Arc<Jar>` cookie store (no pre-seed — FlareSolverr in Phase C populates it).
+- Same client for **every** musescore.com call (search, score page, bundle, jmuse, PNG fetch).
+
+### Phase E — Bundle rewriter fixes + Boa context reuse
+
+Two interleaved goals, both driven by Phase D output.
+
+**(i) Rewriter fixes** — work backwards from whatever stage the smoke test fails at. Likely culprits: `find_random_token`, `find_md5_module_id`, the three replacements in `rewrite_bundle`. Fallback if MuseScore moved to WASM-MD5 or a different module loader: drop Boa entirely, extract `randomToken`, compute MD5 in Rust via the `md-5` crate.
+
+**(ii) Boa context reuse** — change `mint_token` from one Boa `Context` per page to one per score. Currently a 50-page score = 50 × 500 KB string clones + 50 webpack-bundle re-evals; per-score reuse cuts that to 1 × 500 KB. Use `Arc<String>` for `prepared_js` to avoid even the per-score clone. The Plan agent flagged this as the only real perf concern in the pipeline; independent of the rewriter fixes.
+
+### Phase C — FlareSolverr fallback (conditional on B + E being insufficient)
+
+Model: **FlareSolverr is a Cloudflare-clearance-cookie vending machine, not a transport.** Never route per-page PNGs through it (3–5 s/call × 50 pages = UX disaster; FlareSolverr base64-wraps binary bodies; `/api/jmuse` needs custom `Authorization` headers we mint locally).
+
+- New admin setting `flaresolverr_url` + optional `BROWSARR_FLARESOLVERR_URL` env var.
+- New `src/sources/flaresolverr.rs` helper: `solve_for(url) -> Result<Vec<Cookie>>`. POSTs `{cmd: "request.get", url, session: "musescore"}`, returns `cf_clearance` / `__cf_bm` cookies.
+- One long-lived session id, lazy-created.
+- In `musescore.rs`: on first 403 (or specific Cloudflare body shape), call `solve_for`, inject cookies into our existing `Arc<Jar>`, retry once. Fast path stays plain HTTP.
+
+**Known risk:** FlareSolverr's headless-Chrome JA3 differs from rustls's; cookies pass but Cloudflare can still flag the subsequent reqwest call. Rare in practice; worst case forces every call through FlareSolverr, at which point MuseScore becomes prohibitively slow and we reconsider the whole bet.
+
+**Network note:** `sheet-music-browsarr` and the existing `flaresolverr` Portainer stack are on different Docker networks. Either move stacks together or use host IP `http://192.168.0.132:8191`.
+
+### Phase F — Disk PDF cache + cap bump
+
+- Cache path `/cache/musescore/{cache_version}/{id}-{bundle_hash_prefix}.pdf`. `cache_version` constant baked into `musescore.rs` (bump on rewriter changes). `bundle_hash_prefix` = first 8 chars of sha256 of the rewritten bundle (auto-invalidates on MuseScore deploys). Atomic `.tmp` + rename. Cache only successes.
+- Separate `/cache` volume mount in `docker-compose.yml` (don't pollute `/config`, which is the small backed-up settings/DB volume).
+- Bump `MAX_PDF_BYTES` (`src/routes/public.rs`) from 10 MB → 25 MB to match admin path. 50-page scores at 96 DPI land near the 10 MB cap; legitimate content needs headroom.
+- Admin "purge MuseScore cache" button in `/admin/sources` — `walk_dir` + delete + audit-log entry. No selective purge in v1.
+
+### Phase G — UX hardening
+
+- Replace silent 302 in `pdf_handler` with an inline failure page (`templates/pdf_failed.html`): "Couldn't fetch this PDF directly. [Open on MuseScore →] [Back to search]". Same template usable for IMSLP/Mutopia failures.
+- Public banner on `search_results.html` when any source's `SourceHealth.is_degraded()`. Auto-clears on next success.
+- "Open PDF" on a degraded source's cards swaps to "Open on MuseScore" + direct `external_url` link (skip the doomed proxy attempt).
+
+### Explicitly NOT in scope (per Plan-agent review)
+
+- Persisting `SourceHealth` to SQLite — in-memory is enough; `audit_log` is the durable record.
+- Per-source policy enum on the `Source` trait — keep it small; FlareSolverr stays implementation-private to `musescore.rs`.
+- Parallelizing `/api/jmuse` calls — a `buffer_unordered(4)` would give a ~4× speedup; defer until pipeline is reliable.
+- Failure cache — Cloudflare rate-limits clear themselves; we'd just retry on next user action.
+- Pre-emptive FlareSolverr build — Phase C is conditional on B+E being insufficient.
+- Selective per-score cache purge UI — bulk purge button only in v1.
 
 ---
 
