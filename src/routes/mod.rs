@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use sqlx::SqlitePool;
 
-use crate::cache::{SearchCache, ThumbnailCache};
+use crate::cache::{SearchCache, ThumbnailBytesCache, ThumbnailCache};
 use crate::secrets::Secrets;
 use crate::sources::health::HealthMap;
 use crate::sources::Source;
@@ -19,6 +19,10 @@ pub struct AppState {
     /// Resolved-thumbnail URL cache for sources that need a lazy lookup
     /// (currently just IMSLP). 24h TTL; see `src/cache.rs`.
     pub thumbnail_cache: ThumbnailCache,
+    /// Server-rendered thumbnail bytes cache for sources that generate
+    /// inline PNGs (currently just Mutopia via pdftoppm). 24h TTL,
+    /// 500-entry cap; see `src/cache.rs`.
+    pub thumbnail_bytes_cache: ThumbnailBytesCache,
     pub library_path: String,
     /// In-memory per-source liveness (Phase G.0). Reset on container
     /// restart; durable history lives in `audit_log`. See

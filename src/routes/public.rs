@@ -73,13 +73,18 @@ pub fn router() -> Router<AppState> {
         .route("/logout", post(logout))
 }
 
-/// Lazy thumbnail resolver. The IMSLP search emits `thumbnail_url`
-/// pointing at this endpoint; the browser fetches it as the user scrolls
-/// each card into view; we scrape the source's page (cached in
-/// `state.thumbnail_cache` for 24h) and redirect to the source's CDN.
-/// Sources without an override return Err from `Source::thumbnail_url`
-/// and we 404 — the template's `onerror` handler then hides the broken
-/// image.
+/// Lazy thumbnail resolver. Two flavours of source, tried in order:
+///   1. `Source::thumbnail_url` returns a CDN URL (e.g., IMSLP scraped
+///      from the wiki page) → we redirect, caching the URL string in
+///      `state.thumbnail_cache` for 24h.
+///   2. `Source::thumbnail_bytes` returns inline PNG bytes (e.g.,
+///      Mutopia rasterizes the PDF's first page via pdftoppm) → we
+///      serve the bytes with a long Cache-Control so the browser cache
+///      absorbs repeat loads, and stash them in
+///      `state.thumbnail_bytes_cache` so refreshes within the TTL skip
+///      the fetch + rasterize entirely.
+/// Both Err → 404; the template's `onerror` handler hides the broken
+/// image and falls back to the generic placeholder.
 async fn thumbnail_handler(
     State(state): State<AppState>,
     Path((source_id, id)): Path<(String, String)>,
@@ -89,6 +94,9 @@ async fn thumbnail_handler(
     if let Some(url) = state.thumbnail_cache.get(&key).await {
         return Redirect::temporary(&url).into_response();
     }
+    if let Some(entry) = state.thumbnail_bytes_cache.get(&key).await {
+        return inline_thumbnail(&entry.0, entry.1);
+    }
 
     let source = match state.find_source(&source_id) {
         Some(s) => s,
@@ -97,16 +105,48 @@ async fn thumbnail_handler(
         }
     };
 
+    // Prefer the URL-based path: it's cheap (one HTTP HEAD-equivalent
+    // scrape) and lets the CDN absorb load. Fall through to inline
+    // bytes only if the source can't produce a URL.
     match source.thumbnail_url(&id).await {
         Ok(url) => {
             state.thumbnail_cache.insert(key, url.clone()).await;
-            Redirect::temporary(&url).into_response()
+            return Redirect::temporary(&url).into_response();
         }
-        Err(e) => {
-            tracing::warn!(error = %e, source = %source_id, id = %id, "thumbnail fetch failed");
-            (axum::http::StatusCode::NOT_FOUND, "no thumbnail").into_response()
-        }
+        Err(url_err) => match source.thumbnail_bytes(&id).await {
+            Ok((bytes, mime)) => {
+                let resp = inline_thumbnail(&bytes, mime);
+                state
+                    .thumbnail_bytes_cache
+                    .insert(key, Arc::new((bytes, mime)))
+                    .await;
+                resp
+            }
+            Err(bytes_err) => {
+                tracing::warn!(
+                    url_error = %url_err,
+                    bytes_error = %bytes_err,
+                    source = %source_id,
+                    id = %id,
+                    "thumbnail fetch failed"
+                );
+                (axum::http::StatusCode::NOT_FOUND, "no thumbnail").into_response()
+            }
+        },
     }
+}
+
+/// Serve thumbnail bytes inline with a long browser-cache TTL. Same
+/// 24h window as the server-side moka cache; the URL itself is keyed
+/// on a stable (source, id) pair so cache invalidation isn't a concern.
+fn inline_thumbnail(bytes: &[u8], mime: &'static str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=86400"),
+    );
+    (headers, bytes.to_vec()).into_response()
 }
 
 async fn app_css() -> Response {
