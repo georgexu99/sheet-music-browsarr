@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+/* Switch from Tailwind v4's default `prefers-color-scheme` strategy to a
+ * class-based one. `dark:` variants activate when an ancestor (typically
+ * <html>) has class `dark`. The toggle in templates/base.html flips that
+ * class and persists the choice in localStorage. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 /* Source badge palette — one entry per Source impl in src/sources/.
  * Tailwind v4 detects classes used in templates by scanning files; these
  * are emitted via `class="source-badge source-badge-{{ source }}"` in
