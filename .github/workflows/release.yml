@@ -18,6 +18,31 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     if: github.event_name != 'pull_request'
+    # Service container: MuseScore.com is behind Cloudflare's bot challenge,
+    # so the smoke pipeline needs FlareSolverr to navigate past it. Pinning
+    # to v3.3.21 because :latest (3.4.6) has the Xvfb startup regression
+    # that bricks the container on a bunch of host kernels — same pin the
+    # NAS deploy uses. shm_size 2gb is required by Chromium.
+    services:
+      flaresolverr:
+        image: ghcr.io/flaresolverr/flaresolverr:v3.3.21
+        ports:
+          - 8191:8191
+        env:
+          LOG_LEVEL: info
+          CAPTCHA_SOLVER: none
+        options: >-
+          --shm-size=2gb
+          --health-cmd "wget -qO- http://localhost:8191/ | grep -q 'FlareSolverr is ready'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      # The job runs on the runner host (not inside a container), so the
+      # service port is reachable via the host loopback after port mapping.
+      # `flaresolverr:8191` would also work via Docker DNS but localhost is
+      # the more universally-applicable pattern.
+      FLARESOLVERR_URL: http://localhost:8191
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -25,6 +50,8 @@ jobs:
       - name: cargo test musescore_smoke (ignored)
         # `--ignored` is a libtest filter and must follow the `--` separator;
         # cargo itself doesn't accept it as a top-level flag.
+        # The test auto-skips when FLARESOLVERR_URL is unset, so removing
+        # the service block above is a clean toggle if FS ever flakes.
         run: cargo test musescore_smoke -- --ignored --nocapture
 
   build:
