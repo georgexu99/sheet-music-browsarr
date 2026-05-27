@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}Search log &mdash; sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav class="flex items-center gap-4 text-sm border-b border-gray-200 dark:border-gray-800 pb-3 mb-6">
+  <a href="/" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Search</a>
+  <a href="/admin" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Admin</a>
+  <a href="/admin/library" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Library</a>
+  <a href="/admin/sources" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sources</a>
+  <a href="/admin/settings" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Settings</a>
+  <a href="/admin/search-log" class="text-gray-900 dark:text-gray-100 font-medium">Search log</a>
+  <form method="post" action="/logout" class="ml-auto">
+    <button type="submit" class="text-sm text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Sign out</button>
+  </form>
+</nav>
+
+<h1 class="text-2xl font-semibold tracking-tight mb-1">Search log</h1>
+<p class="text-sm text-gray-500 dark:text-gray-400 mb-6">
+  Read-only view over the <code class="font-mono text-xs">audit_log</code> table where <code class="font-mono text-xs">action = 'search'</code>.
+</p>
+
+<div class="flex items-center gap-3 text-sm mb-6">
+  <span class="text-gray-500 dark:text-gray-400">Window:</span>
+  {% if since == "24h" %}
+    <span class="font-medium text-gray-900 dark:text-gray-100">24h</span>
+  {% else %}
+    <a href="/admin/search-log?since=24h" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">24h</a>
+  {% endif %}
+  {% if since == "7d" %}
+    <span class="font-medium text-gray-900 dark:text-gray-100">7d</span>
+  {% else %}
+    <a href="/admin/search-log?since=7d" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">7d</a>
+  {% endif %}
+  {% if since == "30d" %}
+    <span class="font-medium text-gray-900 dark:text-gray-100">30d</span>
+  {% else %}
+    <a href="/admin/search-log?since=30d" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">30d</a>
+  {% endif %}
+</div>
+
+<section class="mb-8">
+  <h2 class="text-base font-medium mb-3">Top queries (last {{ since }})</h2>
+  {% if top.is_empty() %}
+    <p class="text-sm text-gray-500 dark:text-gray-400">No successful searches in this window.</p>
+  {% else %}
+    <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800">
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 dark:bg-gray-900 text-gray-600 dark:text-gray-400 text-left">
+          <tr>
+            <th class="px-3 py-2 font-medium">Query</th>
+            <th class="px-3 py-2 font-medium">Count</th>
+            <th class="px-3 py-2 font-medium">Distinct IPs</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+          {% for row in top %}
+            <tr>
+              <td class="px-3 py-2 font-mono text-xs break-all">
+                {{ row.query }}{% if row.query_truncated %}<span class="text-gray-400 dark:text-gray-500"> (truncated)</span>{% endif %}
+              </td>
+              <td class="px-3 py-2 font-mono">{{ row.count }}</td>
+              <td class="px-3 py-2 font-mono text-gray-500 dark:text-gray-400">{{ row.distinct_ips }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+
+<section>
+  <h2 class="text-base font-medium mb-3">Recent searches (last 200 in window)</h2>
+  {% if recent.is_empty() %}
+    <p class="text-sm text-gray-500 dark:text-gray-400">No searches recorded in this window.</p>
+  {% else %}
+    <div class="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-800">
+      <table class="min-w-full text-sm">
+        <thead class="bg-gray-50 dark:bg-gray-900 text-gray-600 dark:text-gray-400 text-left">
+          <tr>
+            <th class="px-3 py-2 font-medium">When</th>
+            <th class="px-3 py-2 font-medium">Query</th>
+            <th class="px-3 py-2 font-medium">Result</th>
+            <th class="px-3 py-2 font-medium">Hits</th>
+            <th class="px-3 py-2 font-medium">Variants</th>
+            <th class="px-3 py-2 font-medium">IP</th>
+            <th class="px-3 py-2 font-medium">User agent</th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-gray-200 dark:divide-gray-800">
+          {% for row in recent %}
+            <tr>
+              <td class="px-3 py-2 text-gray-500 dark:text-gray-400 font-mono text-xs whitespace-nowrap">{{ row.ts }}</td>
+              <td class="px-3 py-2 font-mono text-xs break-all">
+                {% if row.query.is_empty() %}
+                  <span class="text-gray-400 dark:text-gray-500">&mdash;</span>
+                {% else %}
+                  {{ row.query }}{% if row.query_truncated %}<span class="text-gray-400 dark:text-gray-500"> (truncated)</span>{% endif %}
+                {% endif %}
+              </td>
+              <td class="px-3 py-2">
+                {% if row.result == "ok" %}
+                  <span class="text-green-700 dark:text-green-300">ok</span>
+                {% else %}
+                  <span class="text-gray-500 dark:text-gray-400">{{ row.result }}</span>
+                {% endif %}
+              </td>
+              <td class="px-3 py-2 font-mono">
+                {% match row.results_count %}
+                  {% when Some with (n) %}{{ n }}
+                  {% when None %}<span class="text-gray-400 dark:text-gray-500">&mdash;</span>
+                {% endmatch %}
+              </td>
+              <td class="px-3 py-2 font-mono text-gray-500 dark:text-gray-400">
+                {% match row.variants_count %}
+                  {% when Some with (n) %}{{ n }}
+                  {% when None %}<span class="text-gray-400 dark:text-gray-500">&mdash;</span>
+                {% endmatch %}
+              </td>
+              <td class="px-3 py-2 font-mono text-xs text-gray-500 dark:text-gray-400">{{ row.ip }}</td>
+              <td class="px-3 py-2 text-xs text-gray-500 dark:text-gray-400 break-all max-w-xs">{{ row.user_agent }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}

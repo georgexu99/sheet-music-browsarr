@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use askama::Template;
 use askama_axum::IntoResponse;
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::HeaderMap;
 use axum::middleware::{self, Next};
 use axum::response::{Redirect, Response};
@@ -66,6 +66,32 @@ struct ActivityRow {
 }
 
 #[derive(Template)]
+#[template(path = "admin/search_log.html")]
+struct AdminSearchLog {
+    since: &'static str,
+    recent: Vec<SearchLogRow>,
+    top: Vec<TopQueryRow>,
+}
+
+struct SearchLogRow {
+    query: String,
+    query_truncated: bool,
+    result: String,
+    results_count: Option<i64>,
+    variants_count: Option<i64>,
+    ip: String,
+    user_agent: String,
+    ts: String,
+}
+
+struct TopQueryRow {
+    query: String,
+    query_truncated: bool,
+    count: i64,
+    distinct_ips: i64,
+}
+
+#[derive(Template)]
 #[template(path = "admin/settings.html")]
 struct AdminSettings {
     smtp_host: String,
@@ -85,6 +111,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/library/add", post(library_add))
         .route("/admin/settings", get(settings_get).post(settings_post))
         .route("/admin/sources", get(sources_get))
+        .route("/admin/search-log", get(search_log_get))
         .route_layer(middleware::from_fn(require_admin))
 }
 
@@ -444,5 +471,150 @@ async fn load_recent_activity(state: &AppState) -> Vec<ActivityRow> {
             tracing::warn!(error = %e, "load sources activity failed");
             Vec::new()
         }
+    }
+}
+
+#[derive(Deserialize)]
+struct SearchLogParams {
+    #[serde(default)]
+    since: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SearchMeta {
+    #[serde(default)]
+    results: Option<i64>,
+    #[serde(default)]
+    variants: Option<i64>,
+}
+
+const QUERY_DISPLAY_MAX: usize = 80;
+
+fn truncate_query(s: &str) -> (String, bool) {
+    if s.chars().count() > QUERY_DISPLAY_MAX {
+        let cut: String = s.chars().take(QUERY_DISPLAY_MAX).collect();
+        (format!("{cut}…"), true)
+    } else {
+        (s.to_string(), false)
+    }
+}
+
+/// Resolve the `?since=` window into (label, cutoff_ts_rfc3339).
+/// Accepts "24h", "7d", "30d"; defaults to 7d.
+fn resolve_since(raw: Option<&str>) -> (&'static str, String) {
+    let label: &'static str = match raw.unwrap_or("7d") {
+        "24h" => "24h",
+        "30d" => "30d",
+        _ => "7d",
+    };
+    let dur = match label {
+        "24h" => time::Duration::hours(24),
+        "30d" => time::Duration::days(30),
+        _ => time::Duration::days(7),
+    };
+    let cutoff = time::OffsetDateTime::now_utc() - dur;
+    let cutoff_s = cutoff.format(&Rfc3339).unwrap_or_default();
+    (label, cutoff_s)
+}
+
+async fn search_log_get(
+    State(state): State<AppState>,
+    Query(params): Query<SearchLogParams>,
+) -> impl IntoResponse {
+    let (since_label, cutoff_ts) = resolve_since(params.since.as_deref());
+
+    // Recent list: last 200 search rows in the window, newest first.
+    let recent_rows = sqlx::query(
+        r#"
+        SELECT ts, ip, COALESCE(user_agent, '') AS user_agent, target, result, meta
+        FROM audit_log
+        WHERE action = 'search'
+          AND ts >= ?
+        ORDER BY ts DESC
+        LIMIT 200
+        "#,
+    )
+    .bind(&cutoff_ts)
+    .fetch_all(&state.pool)
+    .await;
+
+    let recent: Vec<SearchLogRow> = match recent_rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| {
+                let target: Option<String> = r.try_get::<Option<String>, _>("target").ok().flatten();
+                let raw_q = target.unwrap_or_default();
+                let (query, query_truncated) = truncate_query(&raw_q);
+                let meta_str: Option<String> = r.try_get::<Option<String>, _>("meta").ok().flatten();
+                let (results_count, variants_count) = match meta_str.as_deref() {
+                    Some(s) if !s.is_empty() => match serde_json::from_str::<SearchMeta>(s) {
+                        Ok(m) => (m.results, m.variants),
+                        Err(_) => (None, None),
+                    },
+                    _ => (None, None),
+                };
+                SearchLogRow {
+                    query,
+                    query_truncated,
+                    result: r.get::<String, _>("result"),
+                    results_count,
+                    variants_count,
+                    ip: r.get::<String, _>("ip"),
+                    user_agent: r.get::<String, _>("user_agent"),
+                    ts: r.get::<String, _>("ts"),
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "load search log recent failed");
+            Vec::new()
+        }
+    };
+
+    // Top queries: aggregate by target text in the window.
+    let top_rows = sqlx::query(
+        r#"
+        SELECT
+            target AS query,
+            COUNT(*) AS cnt,
+            COUNT(DISTINCT ip) AS distinct_ips
+        FROM audit_log
+        WHERE action = 'search'
+          AND result = 'ok'
+          AND target IS NOT NULL
+          AND ts >= ?
+        GROUP BY target
+        ORDER BY cnt DESC, query ASC
+        LIMIT 50
+        "#,
+    )
+    .bind(&cutoff_ts)
+    .fetch_all(&state.pool)
+    .await;
+
+    let top: Vec<TopQueryRow> = match top_rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| {
+                let raw_q: String = r.try_get::<Option<String>, _>("query").ok().flatten().unwrap_or_default();
+                let (query, query_truncated) = truncate_query(&raw_q);
+                TopQueryRow {
+                    query,
+                    query_truncated,
+                    count: r.get::<i64, _>("cnt"),
+                    distinct_ips: r.get::<i64, _>("distinct_ips"),
+                }
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "load search log top failed");
+            Vec::new()
+        }
+    };
+
+    AdminSearchLog {
+        since: since_label,
+        recent,
+        top,
     }
 }
