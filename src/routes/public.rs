@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 use askama::Template;
 use askama_axum::IntoResponse;
@@ -21,7 +21,7 @@ use crate::rate_limit;
 use crate::secrets::Secrets;
 use crate::settings;
 use crate::sources::health;
-use crate::sources::{SearchResult, Source};
+use crate::sources::{Instrument, SearchFilters, SearchResult, Source};
 use crate::turnstile;
 use std::sync::Arc;
 
@@ -61,6 +61,8 @@ struct SearchPage {
     /// `Some`. `SearchPage` and `ResultsPartial` share the partial via
     /// `{% include %}`, so their context shapes must match.
     next_page: Option<u32>,
+    sources: Vec<SourceFilterOption>,
+    instruments: Vec<InstrumentFilterOption>,
 }
 
 #[derive(Template)]
@@ -70,6 +72,84 @@ struct ResultsPartial {
     results: Vec<SearchResult>,
     turnstile_site_key: Option<String>,
     next_page: Option<u32>,
+}
+
+struct SourceFilterOption {
+    id: &'static str,
+    display: &'static str,
+    selected: bool,
+}
+
+struct InstrumentFilterOption {
+    slug: &'static str,
+    display: &'static str,
+    selected: bool,
+}
+
+/// Build the per-render filter UI state.
+///
+/// `source_filter = None` means "no `sources` param present in the URL" — the
+/// default, all checkboxes ticked. `Some(set)` means the user supplied a
+/// specific subset (possibly empty); we honour exactly that.
+fn build_filter_options(
+    state: &AppState,
+    source_filter: Option<&HashSet<String>>,
+    instrument: Option<Instrument>,
+) -> (Vec<SourceFilterOption>, Vec<InstrumentFilterOption>) {
+    let sources = state
+        .sources
+        .iter()
+        .map(|s| SourceFilterOption {
+            id: s.id(),
+            display: s.display_name(),
+            selected: source_filter
+                .map(|f| f.contains(s.id()))
+                .unwrap_or(true),
+        })
+        .collect();
+    let instruments = Instrument::ALL
+        .iter()
+        .map(|i| InstrumentFilterOption {
+            slug: i.slug(),
+            display: i.display(),
+            selected: instrument == Some(*i),
+        })
+        .collect();
+    (sources, instruments)
+}
+
+/// Parse the `sources` query param(s). Returns `None` when no `sources` key
+/// is present at all (default = all enabled). Accepts both repeated
+/// (`?sources=a&sources=b`) and comma-separated (`?sources=a,b`) forms so
+/// hand-typed URLs stay friendly while HTMX form serialization works
+/// out-of-the-box.
+fn parse_source_filter(params: &[(String, String)]) -> Option<HashSet<String>> {
+    let mut acc = HashSet::new();
+    let mut saw_any = false;
+    for (k, v) in params {
+        if k != "sources" {
+            continue;
+        }
+        saw_any = true;
+        for part in v.split(',') {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                acc.insert(trimmed.to_string());
+            }
+        }
+    }
+    if saw_any {
+        Some(acc)
+    } else {
+        None
+    }
+}
+
+fn first_param<'a>(params: &'a [(String, String)], key: &str) -> Option<&'a str> {
+    params
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.as_str())
 }
 
 #[derive(Template)]
@@ -186,12 +266,15 @@ async fn home(State(state): State<AppState>) -> impl IntoResponse {
     let site_key = settings::get(&state.pool, settings::TURNSTILE_SITE_KEY)
         .await
         .filter(|s| !s.is_empty());
+    let (sources, instruments) = build_filter_options(&state, None, None);
     SearchPage {
         query: String::new(),
         results: Vec::new(),
         turnstile_site_key: site_key,
         message: None,
         next_page: None,
+        sources,
+        instruments,
     }
 }
 
@@ -202,22 +285,29 @@ async fn healthz() -> &'static str {
 async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(params): Query<HashMap<String, String>>,
+    // Vec<(String, String)> preserves repeated query keys (HTMX serialises
+    // the `sources` checkbox group as `?sources=imslp&sources=mutopia`),
+    // which a HashMap would clobber. Single-value params (`q`, `instrument`)
+    // are read out via first_param().
+    Query(params): Query<Vec<(String, String)>>,
 ) -> Response {
-    let query = params
-        .get("q")
-        .cloned()
+    let query = first_param(&params, "q")
         .unwrap_or_default()
         .trim()
         .to_string();
+    let instrument = first_param(&params, "instrument")
+        .filter(|s| !s.is_empty())
+        .and_then(Instrument::from_slug);
+    let source_filter = parse_source_filter(&params);
+    let filters = SearchFilters { instrument };
+
     let is_htmx = headers.get("hx-request").is_some();
     let ip = audit::client_ip(&headers);
     let ua = audit::user_agent(&headers);
 
     // 1-based page index. Out-of-range / unparsable / over-cap inputs fall
     // back to page 1; we'd rather show something than 4xx the user.
-    let page: u32 = params
-        .get("page")
+    let page: u32 = first_param(&params, "page")
         .and_then(|s| s.parse::<u32>().ok())
         .filter(|p| *p >= 1 && *p <= SEARCH_MAX_PAGE)
         .unwrap_or(1);
@@ -237,13 +327,31 @@ async fn search(
             None,
         )
         .await;
-        return render_results(is_htmx, &query, Vec::new(), site_key, None).into_response();
+        return render_response(
+            is_htmx,
+            &state,
+            &query,
+            Vec::new(),
+            site_key,
+            None,
+            source_filter.as_ref(),
+            instrument,
+        );
     }
     if query.chars().count() < SEARCH_MIN_QUERY_LEN {
         // Typeahead: too short to be useful and the upstream sources will
         // mostly return noise. Return an empty result set silently — the
         // user will keep typing.
-        return render_results(is_htmx, &query, Vec::new(), site_key, None).into_response();
+        return render_response(
+            is_htmx,
+            &state,
+            &query,
+            Vec::new(),
+            site_key,
+            None,
+            source_filter.as_ref(),
+            instrument,
+        );
     }
 
     // Multilingual expansion: a single user query becomes up to 4 query
@@ -251,11 +359,25 @@ async fn search(
     // composer or instrument names are recognised. See src/i18n/alias.rs.
     let variants = i18n::expand_query(&query);
 
+    // Source-selection narrows the fan-out at the route layer — disabled
+    // sources never get a request fired, so it stays cheap. Default
+    // (`source_filter = None`) means all sources are enabled.
+    let selected_sources: Vec<Arc<dyn Source>> = state
+        .sources
+        .iter()
+        .filter(|s| {
+            source_filter
+                .as_ref()
+                .map(|f| f.contains(s.id()))
+                .unwrap_or(true)
+        })
+        .cloned()
+        .collect();
+
     // Cross-product: (source, variant) -> one parallel search future.
     // Failing futures get a logged warn + empty Vec; nothing poisons the
     // whole search.
-    let pairs: Vec<(Arc<dyn Source>, String)> = state
-        .sources
+    let pairs: Vec<(Arc<dyn Source>, String)> = selected_sources
         .iter()
         .flat_map(|s| {
             let src = s.clone();
@@ -272,8 +394,9 @@ async fn search(
     let futures = pairs.into_iter().map(|(src, v)| {
         let cache = search_cache.clone();
         let health = health_map.clone();
+        let f = filters.clone();
         async move {
-            match cache::cached_search(&cache, &src, &v, per_source_limit).await {
+            match cache::cached_search(&cache, &src, &v, &f, per_source_limit).await {
                 Ok(rs) => {
                     // Cache hits also count as "ok" — if the cache has a
                     // valid entry, the source was reachable within the last
@@ -298,7 +421,7 @@ async fn search(
 
     // Dedupe across (source, id) — the same work commonly surfaces via
     // multiple variants (e.g. "Chopin" and "肖邦" both return it).
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut results = Vec::new();
     for group in groups {
         for r in group {
@@ -352,15 +475,30 @@ async fn search(
     // moka cache (`src/cache.rs`) already absorbs cross-user repeat
     // queries; the browser-side cache would only deduplicate same-user
     // self-repeat which isn't worth the partial-vs-full collision.
-    render_results(is_htmx, &query, results, site_key, next_page).into_response()
+    render_response(
+        is_htmx,
+        &state,
+        &query,
+        results,
+        site_key,
+        next_page,
+        source_filter.as_ref(),
+        instrument,
+    )
 }
 
-fn render_results(
+/// HTMX requests get the results-only partial (filter controls live outside
+/// the swap target so they don't need re-rendering); full-page navigations
+/// render the search shell with filter state populated.
+fn render_response(
     is_htmx: bool,
+    state: &AppState,
     query: &str,
     results: Vec<SearchResult>,
     site_key: Option<String>,
     next_page: Option<u32>,
+    source_filter: Option<&HashSet<String>>,
+    instrument: Option<Instrument>,
 ) -> Response {
     if is_htmx {
         ResultsPartial {
@@ -371,12 +509,15 @@ fn render_results(
         }
         .into_response()
     } else {
+        let (sources, instruments) = build_filter_options(state, source_filter, instrument);
         SearchPage {
             query: query.to_string(),
             results,
             turnstile_site_key: site_key,
             message: None,
             next_page,
+            sources,
+            instruments,
         }
         .into_response()
     }

@@ -8,7 +8,7 @@ use reqwest::cookie::Jar;
 use reqwest::{Client, Url};
 use scraper::{Html, Selector};
 
-use super::{SearchResult, Source};
+use super::{Instrument, SearchFilters, SearchResult, Source};
 
 const USER_AGENT: &str = concat!(
     "sheet-music-browsarr/",
@@ -155,7 +155,23 @@ impl Source for Imslp {
         format!("https://imslp.org/wiki/{}", id)
     }
 
-    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
+    async fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        // IMSLP's OpenSearch API has no instrument facet. We keep the query
+        // clean (polluting it with the instrument slug would degrade
+        // MediaWiki's ranking) and instead filter in-memory after parsing —
+        // see the retain() block below. When a filter is active we widen
+        // the upstream limit so the filter has more candidates to choose
+        // from before we truncate to the caller's limit.
+        let upstream_limit = if filters.instrument.is_some() {
+            limit.saturating_mul(4).max(20)
+        } else {
+            limit
+        };
         let resp = self
             .http
             .get("https://imslp.org/api.php")
@@ -163,7 +179,7 @@ impl Source for Imslp {
                 ("action", "opensearch"),
                 ("search", query),
                 ("format", "json"),
-                ("limit", &limit.to_string()),
+                ("limit", &upstream_limit.to_string()),
                 ("namespace", "0"),
             ])
             .send()
@@ -223,6 +239,30 @@ impl Source for Imslp {
                 metadata: Vec::new(),
             });
         }
+
+        // Post-hoc instrument filter: drop entries whose title/description
+        // don't mention the instrument keyword. Lossy (a work *for* the
+        // instrument that doesn't name it in title or snippet is missed —
+        // e.g., a Chopin Mazurka under instrument=Piano), but precise (no
+        // false positives), and keeps OpenSearch ranking on the clean
+        // query. The right long-term fix is IMSLP MediaWiki category
+        // traversal; deferred.
+        if let Some(inst) = filters.instrument {
+            let needles = instrument_keywords(inst);
+            results.retain(|r| {
+                let title_lc = r.title.to_lowercase();
+                let desc_lc = r
+                    .description
+                    .as_deref()
+                    .map(str::to_lowercase)
+                    .unwrap_or_default();
+                needles
+                    .iter()
+                    .any(|n| title_lc.contains(n) || desc_lc.contains(n))
+            });
+        }
+        results.truncate(limit);
+
         Ok(results)
     }
 
@@ -273,6 +313,25 @@ impl Source for Imslp {
 
 fn page_id_from_url(url: &str) -> Option<String> {
     url.split_once("/wiki/").map(|(_, rest)| rest.to_string())
+}
+
+/// Keywords used to recognise an instrument in IMSLP titles/descriptions
+/// during post-hoc filtering. Most instruments match on their slug alone;
+/// Voice/Choral expand to common formal labels (lieder, mass, etc.) and
+/// Cello includes IMSLP's preferred "violoncello".
+fn instrument_keywords(inst: Instrument) -> &'static [&'static str] {
+    match inst {
+        Instrument::Piano => &["piano"],
+        Instrument::Guitar => &["guitar"],
+        Instrument::Violin => &["violin"],
+        Instrument::Viola => &["viola"],
+        Instrument::Cello => &["cello", "violoncello"],
+        Instrument::Flute => &["flute"],
+        Instrument::Clarinet => &["clarinet"],
+        Instrument::Voice => &["voice", "vocal", "lied", "lieder", "song", "aria"],
+        Instrument::Choral => &["choral", "choir", "chorus", "mass", "requiem", "motet"],
+        Instrument::Organ => &["organ"],
+    }
 }
 
 fn absolutize(href: &str) -> String {

@@ -6,6 +6,96 @@ pub mod imslp;
 pub mod musescore;
 pub mod mutopia;
 
+/// User-selectable instrument filter. Each source decides how to apply it:
+/// Mutopia maps to its native `Instrument` CGI facet, MuseScore to its
+/// `&instrument=` URL param, IMSLP filters post-hoc by checking title and
+/// description text against per-instrument keywords (the OpenSearch API has
+/// no facet).
+#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+pub enum Instrument {
+    Piano,
+    Guitar,
+    Violin,
+    Viola,
+    Cello,
+    Flute,
+    Clarinet,
+    Voice,
+    Choral,
+    Organ,
+}
+
+impl Instrument {
+    /// URL-safe lowercase identifier. Matches MuseScore's `&instrument=`
+    /// values where applicable.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Instrument::Piano => "piano",
+            Instrument::Guitar => "guitar",
+            Instrument::Violin => "violin",
+            Instrument::Viola => "viola",
+            Instrument::Cello => "cello",
+            Instrument::Flute => "flute",
+            Instrument::Clarinet => "clarinet",
+            Instrument::Voice => "voice",
+            Instrument::Choral => "choral",
+            Instrument::Organ => "organ",
+        }
+    }
+
+    /// Title-case label for the dropdown.
+    pub fn display(&self) -> &'static str {
+        match self {
+            Instrument::Piano => "Piano",
+            Instrument::Guitar => "Guitar",
+            Instrument::Violin => "Violin",
+            Instrument::Viola => "Viola",
+            Instrument::Cello => "Cello",
+            Instrument::Flute => "Flute",
+            Instrument::Clarinet => "Clarinet",
+            Instrument::Voice => "Voice",
+            Instrument::Choral => "Choral",
+            Instrument::Organ => "Organ",
+        }
+    }
+
+    /// Mutopia's CGI `Instrument` field is case-sensitive and expects the
+    /// title-case form (e.g. "Piano", "Guitar"). `Choral` maps to Mutopia's
+    /// "Choir" entry.
+    pub fn mutopia_value(&self) -> &'static str {
+        match self {
+            Instrument::Choral => "Choir",
+            _ => self.display(),
+        }
+    }
+
+    pub fn from_slug(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|i| i.slug() == s)
+    }
+
+    /// Fixed display order for the UI dropdown.
+    pub const ALL: &'static [Instrument] = &[
+        Instrument::Piano,
+        Instrument::Guitar,
+        Instrument::Violin,
+        Instrument::Viola,
+        Instrument::Cello,
+        Instrument::Flute,
+        Instrument::Clarinet,
+        Instrument::Voice,
+        Instrument::Choral,
+        Instrument::Organ,
+    ];
+}
+
+/// Optional facets the search route forwards to each source. Sources that
+/// can't honour a given filter natively apply a best-effort fallback
+/// (typically appending the instrument slug to the query).
+#[derive(Debug, Clone, Default, Hash, Eq, PartialEq)]
+pub struct SearchFilters {
+    pub instrument: Option<Instrument>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResult {
     /// Stable identifier of the source this result came from (e.g., "imslp",
@@ -78,7 +168,12 @@ pub trait Source: Send + Sync {
     /// fallback when `fetch_pdf_bytes` cannot resolve a real PDF.
     fn external_url(&self, id: &str) -> String;
 
-    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>>;
+    async fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>>;
 
     /// Download a work's PDF bytes, refusing anything larger than
     /// `max_bytes`. The trait does buffered fetch (not streaming) so the
@@ -104,5 +199,25 @@ pub trait Source: Send + Sync {
     /// inline-bytes paths.
     async fn thumbnail_bytes(&self, _id: &str) -> anyhow::Result<(Vec<u8>, &'static str)> {
         anyhow::bail!("source does not provide inline thumbnails")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn instrument_slug_roundtrip() {
+        for i in Instrument::ALL {
+            assert_eq!(Instrument::from_slug(i.slug()), Some(*i));
+        }
+        assert_eq!(Instrument::from_slug("not-a-real-instrument"), None);
+        assert_eq!(Instrument::from_slug(""), None);
+    }
+
+    #[test]
+    fn mutopia_value_remaps_choral() {
+        assert_eq!(Instrument::Choral.mutopia_value(), "Choir");
+        assert_eq!(Instrument::Piano.mutopia_value(), "Piano");
     }
 }

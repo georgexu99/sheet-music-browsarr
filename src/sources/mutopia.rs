@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use scraper::{Html, Selector};
 
-use super::{BadgeKind, MetadataBadge, SearchResult, Source};
+use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
 
 /// Cap on the PDF size we'll download just to generate a thumbnail.
 /// Most Mutopia PDFs are well under this; engraved scores grow with
@@ -65,7 +65,19 @@ impl Source for Mutopia {
         decode_url(id).unwrap_or_else(|| format!("{BASE}/cgibin/make-table.cgi"))
     }
 
-    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
+    async fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        // Mutopia exposes Instrument as a first-class CGI facet; just
+        // populate its existing field. Title-case strings ("Piano",
+        // "Guitar", …); see Instrument::mutopia_value for the mapping.
+        let instrument = filters
+            .instrument
+            .map(|i| i.mutopia_value())
+            .unwrap_or("");
         let resp = self
             .http
             .get(format!("{BASE}/cgibin/make-table.cgi"))
@@ -73,7 +85,7 @@ impl Source for Mutopia {
                 ("searchingfor", query),
                 ("Composer", ""),
                 ("Style", ""),
-                ("Instrument", ""),
+                ("Instrument", instrument),
                 ("Collection", ""),
                 ("recent", ""),
                 ("timelength", ""),

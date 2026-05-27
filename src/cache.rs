@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use moka::future::Cache;
 
-use crate::sources::{SearchResult, Source};
+use crate::sources::{Instrument, SearchFilters, SearchResult, Source};
 
 #[derive(Hash, Eq, PartialEq, Clone)]
 pub struct CacheKey {
@@ -15,6 +15,9 @@ pub struct CacheKey {
     /// page-1 results. Including it here keeps each requested page-size
     /// in its own cache slot.
     pub limit: usize,
+    /// Active instrument filter; entries cached against a Piano filter
+    /// must not be served to an unfiltered request and vice versa.
+    pub instrument: Option<Instrument>,
 }
 
 /// Cross-user search-result cache. Entries are `Arc<Vec<SearchResult>>` so
@@ -71,17 +74,19 @@ pub async fn cached_search(
     cache: &SearchCache,
     source: &Arc<dyn Source>,
     query: &str,
+    filters: &SearchFilters,
     limit: usize,
 ) -> anyhow::Result<Vec<SearchResult>> {
     let key = CacheKey {
         source: source.id(),
         query: query.to_string(),
         limit,
+        instrument: filters.instrument,
     };
     if let Some(cached) = cache.get(&key).await {
         return Ok((*cached).clone());
     }
-    let results = source.search(query, limit).await?;
+    let results = source.search(query, filters, limit).await?;
     cache.insert(key, Arc::new(results.clone())).await;
     Ok(results)
 }

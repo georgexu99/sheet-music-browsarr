@@ -15,24 +15,69 @@
   {% when None %}
 {% endmatch %}
 
-<form action="/search" method="get" role="search" class="flex items-center gap-2 mb-8">
-  <input
-    type="search"
-    name="q"
-    value="{{ query }}"
-    placeholder="composer, piece, opus, 肖邦, xiaobang…"
-    autofocus
-    autocomplete="off"
-    aria-label="Sheet music search"
-    class="flex-1 text-base sm:text-lg px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow"
-    hx-get="/search"
-    hx-target="#results"
-    hx-trigger="keyup changed delay:300ms, search, input changed delay:300ms"
-    hx-indicator="#search-loading"
-    hx-sync="this:replace"
-    hx-push-url="true"
-  >
-  <span id="search-loading" class="htmx-indicator text-sm text-gray-500 dark:text-gray-400 px-2 whitespace-nowrap" aria-live="polite">Searching&hellip;</span>
+<form action="/search" method="get" role="search" class="mb-6">
+  <div class="flex items-center gap-2 mb-3">
+    <input
+      type="search"
+      name="q"
+      value="{{ query }}"
+      placeholder="composer, piece, opus, 肖邦, xiaobang…"
+      autofocus
+      autocomplete="off"
+      aria-label="Sheet music search"
+      class="flex-1 text-base sm:text-lg px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow"
+      hx-get="/search"
+      hx-target="#results"
+      hx-trigger="keyup changed delay:300ms, search, input changed delay:300ms"
+      hx-include="closest form"
+      hx-indicator="#search-loading"
+      hx-sync="this:replace"
+      hx-push-url="true"
+    >
+    <span id="search-loading" class="htmx-indicator text-sm text-gray-500 dark:text-gray-400 px-2 whitespace-nowrap" aria-live="polite">Searching&hellip;</span>
+  </div>
+
+  <div class="flex flex-wrap items-center gap-x-4 gap-y-2 text-sm">
+    <div class="flex flex-wrap items-center gap-2" role="group" aria-label="Source filter">
+      {% for s in sources %}
+        <label class="cursor-pointer">
+          <input
+            type="checkbox"
+            name="sources"
+            value="{{ s.id }}"
+            class="peer sr-only"
+            {% if s.selected %}checked{% endif %}
+            hx-get="/search"
+            hx-target="#results"
+            hx-trigger="change"
+            hx-include="closest form"
+            hx-push-url="true"
+          >
+          <span class="px-3 py-1 rounded-full border border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-400 peer-checked:bg-gray-900 peer-checked:text-white peer-checked:border-gray-900 dark:peer-checked:bg-gray-100 dark:peer-checked:text-gray-900 dark:peer-checked:border-gray-100 hover:border-gray-400 dark:hover:border-gray-500 transition-colors select-none">
+            {{ s.display }}
+          </span>
+        </label>
+      {% endfor %}
+    </div>
+
+    <label class="flex items-center gap-2 text-gray-600 dark:text-gray-400">
+      <span>Instrument</span>
+      <select
+        name="instrument"
+        class="px-3 py-1.5 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+        hx-get="/search"
+        hx-target="#results"
+        hx-trigger="change"
+        hx-include="closest form"
+        hx-push-url="true"
+      >
+        <option value="">Any</option>
+        {% for i in instruments %}
+          <option value="{{ i.slug }}" {% if i.selected %}selected{% endif %}>{{ i.display }}</option>
+        {% endfor %}
+      </select>
+    </label>
+  </div>
 </form>
 
 <div id="results">

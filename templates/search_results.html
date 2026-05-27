@@ -76,11 +76,14 @@
       <!-- Full-replace pagination: the button asks for page=N, which the
            server renders as the cumulative 1..N slice and swaps into
            #results wholesale. Simpler than appending and survives back-nav,
-           double-clicks, and reloads cleanly. -->
+           double-clicks, and reloads cleanly. `hx-include` re-submits the
+           filter form (q, sources, instrument) so paging respects the
+           active filters; if it didn't, page 2 would silently drop them. -->
       <div class="mt-6 flex justify-center">
         <button
           type="button"
-          hx-get="/search?q={{ query }}&page={{ np }}"
+          hx-get="/search?page={{ np }}"
+          hx-include="form[role='search']"
           hx-target="#results"
           hx-swap="innerHTML"
           hx-indicator="#load-more-loading"

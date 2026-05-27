@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::{BadgeKind, MetadataBadge, SearchResult, Source};
+use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
 
 // MuseScore.com aggressively rejects obvious bot UAs (Cloudflare challenge
 // page on the score-page fetch). A modern desktop Chrome UA is required.
@@ -258,11 +258,27 @@ impl Source for Musescore {
         format!("https://musescore.com/score/{id}")
     }
 
-    async fn search(&self, query: &str, limit: usize) -> anyhow::Result<Vec<SearchResult>> {
-        let url = format!(
-            "https://musescore.com/sheetmusic?text={}",
-            urlencoding::encode(query)
-        );
+    async fn search(
+        &self,
+        query: &str,
+        filters: &SearchFilters,
+        limit: usize,
+    ) -> anyhow::Result<Vec<SearchResult>> {
+        // MuseScore's /sheetmusic search page accepts an `instrument` slug
+        // param. Slugs line up with our Instrument::slug() values for the
+        // common cases; for ones MuseScore doesn't recognise the param is
+        // silently ignored, leaving the bare text search.
+        let url = match filters.instrument {
+            Some(inst) => format!(
+                "https://musescore.com/sheetmusic?text={}&instrument={}",
+                urlencoding::encode(query),
+                inst.slug()
+            ),
+            None => format!(
+                "https://musescore.com/sheetmusic?text={}",
+                urlencoding::encode(query)
+            ),
+        };
         let resp = self
             .http
             .get(&url)
