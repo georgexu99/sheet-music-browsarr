@@ -31,6 +31,13 @@
               <h2 class="text-base font-medium leading-snug">{{ r.title }}</h2>
               <span class="source-badge source-badge-{{ r.source }} shrink-0">{{ r.source }}</span>
             </div>
+            {% if !r.metadata.is_empty() %}
+              <div class="flex flex-wrap gap-1.5 mb-2">
+                {% for m in r.metadata %}
+                  <span class="meta-badge">{{ m.label }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
             {% match r.description %}
               {% when Some with (desc) %}
                 <p class="text-sm text-gray-500 dark:text-gray-400 mb-2 leading-relaxed">{{ desc }}</p>
@@ -64,4 +71,24 @@
       </li>
     {% endfor %}
   </ul>
+  {% match next_page %}
+    {% when Some with (np) %}
+      <!-- Full-replace pagination: the button asks for page=N, which the
+           server renders as the cumulative 1..N slice and swaps into
+           #results wholesale. Simpler than appending and survives back-nav,
+           double-clicks, and reloads cleanly. -->
+      <div class="mt-6 flex justify-center">
+        <button
+          type="button"
+          hx-get="/search?q={{ query }}&page={{ np }}"
+          hx-target="#results"
+          hx-swap="innerHTML"
+          hx-indicator="#load-more-loading"
+          hx-push-url="true"
+          class="inline-flex items-center px-4 py-2 rounded-md border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-sm font-medium text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors"
+        >Load more</button>
+        <span id="load-more-loading" class="htmx-indicator ml-3 self-center text-sm text-gray-500 dark:text-gray-400">Loading&hellip;</span>
+      </div>
+    {% when None %}
+  {% endmatch %}
 {% endif %}

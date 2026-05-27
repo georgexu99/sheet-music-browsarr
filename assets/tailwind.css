@@ -31,4 +31,11 @@
   .source-badge-musescore {
     @apply bg-orange-100 text-orange-800 dark:bg-orange-950 dark:text-orange-200;
   }
+  /* Per-result metadata pills (pages, instrument, key, year, ...). One
+   * neutral gray palette across all BadgeKind variants — they're context,
+   * not focus. Mirrors source-badge sizing minus uppercase/letter-spacing
+   * so the kerning of mixed case ("12 pages", "Baroque") reads naturally. */
+  .meta-badge {
+    @apply inline-block px-2 py-0.5 text-xs font-medium rounded-full bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300;
+  }
 }

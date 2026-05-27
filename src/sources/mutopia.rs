@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use reqwest::Client;
 use scraper::{Html, Selector};
 
-use super::{SearchResult, Source};
+use super::{BadgeKind, MetadataBadge, SearchResult, Source};
 
 /// Cap on the PDF size we'll download just to generate a thumbnail.
 /// Most Mutopia PDFs are well under this; engraved scores grow with
@@ -91,39 +91,77 @@ impl Source for Mutopia {
         }
         let html = resp.text().await.context("mutopia search body")?;
 
-        // Mutopia's results page lays each piece out as a table block. The
-        // simplest way to extract them: collect every anchor whose href
-        // points at a piece page (`/cgibin/piece-info.cgi?id=...`) or a
-        // direct PDF file under `/ftp/`. Group by surrounding row and emit
-        // one SearchResult per piece, preferring direct PDF links.
+        // Mutopia's results page lays each piece out as a `table.result-table`
+        // block with rows:
+        //   r1: <title> | <composer> | <opus/cat> | n/a
+        //   r2: "for <instrumentation>" | <year/century> | <style/period> | n/a
+        //   r3: <notes> | <license> | <piece-info link> | <date>
+        //   r4-r5: download links (ly, mid, preview, ftp, ps.gz, A4 pdf, ...)
+        // We walk per-piece tables so each result owns a stable title,
+        // description, and metadata badge set rather than reverse-engineering
+        // them from the PDF filename.
         let results = {
             let doc = Html::parse_document(&html);
-            let pdf_sel =
-                Selector::parse("a[href$='-a4.pdf'], a[href$='-let.pdf'], a[href$='.pdf']")
-                    .map_err(|e| anyhow::anyhow!("pdf selector: {e}"))?;
+            let table_sel = Selector::parse("table.result-table")
+                .map_err(|e| anyhow::anyhow!("table selector: {e}"))?;
+            let row_sel = Selector::parse("tr")
+                .map_err(|e| anyhow::anyhow!("row selector: {e}"))?;
+            let cell_sel = Selector::parse("td")
+                .map_err(|e| anyhow::anyhow!("cell selector: {e}"))?;
+            let a_sel = Selector::parse("a[href]")
+                .map_err(|e| anyhow::anyhow!("anchor selector: {e}"))?;
 
             let mut seen = std::collections::HashSet::new();
             let mut out: Vec<SearchResult> = Vec::new();
-            for el in doc.select(&pdf_sel) {
+            for table in doc.select(&table_sel) {
                 if out.len() >= limit {
                     break;
                 }
-                let href = match el.value().attr("href") {
-                    Some(h) => h,
+                let rows: Vec<_> = table.select(&row_sel).collect();
+                if rows.is_empty() {
+                    continue;
+                }
+
+                // Prefer the A4 PDF; fall back to any *.pdf anchor.
+                let mut a4_pdf: Option<String> = None;
+                let mut any_pdf: Option<String> = None;
+                for a in table.select(&a_sel) {
+                    let Some(href) = a.value().attr("href") else { continue };
+                    let lower = href.to_lowercase();
+                    if !lower.ends_with(".pdf") {
+                        continue;
+                    }
+                    if a4_pdf.is_none() && lower.ends_with("-a4.pdf") {
+                        a4_pdf = Some(absolutize(href));
+                    } else if any_pdf.is_none() {
+                        any_pdf = Some(absolutize(href));
+                    }
+                }
+                let url = match a4_pdf.or(any_pdf) {
+                    Some(u) => u,
                     None => continue,
                 };
-                let url = absolutize(href);
                 if !seen.insert(url.clone()) {
                     continue;
                 }
-                // Title heuristic: filename without extension and -a4/-let suffix.
-                let filename = url.rsplit('/').next().unwrap_or("").to_string();
-                let title = filename
-                    .trim_end_matches(".pdf")
-                    .trim_end_matches("-a4")
-                    .trim_end_matches("-let")
-                    .replace('-', " ")
-                    .replace('_', " ");
+
+                // r1 cell 0 = title.
+                let first_cells: Vec<_> = rows[0].select(&cell_sel).collect();
+                let title = first_cells
+                    .first()
+                    .map(|c| clean_cell_text(&c.text().collect::<String>()))
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| {
+                        // Fall back to the PDF-filename heuristic if the
+                        // table layout shifted from under us.
+                        let filename = url.rsplit('/').next().unwrap_or("").to_string();
+                        filename
+                            .trim_end_matches(".pdf")
+                            .trim_end_matches("-a4")
+                            .trim_end_matches("-let")
+                            .replace('-', " ")
+                            .replace('_', " ")
+                    });
                 if title.is_empty() {
                     continue;
                 }
@@ -135,13 +173,58 @@ impl Source for Mutopia {
                 // template's `loading="lazy"` keeps this off the search
                 // critical path.
                 let thumbnail_url = Some(format!("/thumbnail/mutopia/{id}"));
+
+                // Composer (r1 cell 1) becomes the description, stripped of
+                // the "by " prefix Mutopia uses for attributed works.
+                let composer = first_cells
+                    .get(1)
+                    .map(|c| clean_cell_text(&c.text().collect::<String>()))
+                    .filter(|s| !s.is_empty() && s != "Anonymous")
+                    .map(|s| s.trim_start_matches("by ").to_string());
+
+                // r2 cell 0 = "for <instrumentation>"; cell 1 = year/century;
+                // cell 2 = style/period.
+                let mut metadata: Vec<MetadataBadge> = Vec::new();
+                if let Some(r2) = rows.get(1) {
+                    let r2_cells: Vec<_> = r2.select(&cell_sel).collect();
+                    if let Some(c) = r2_cells.first() {
+                        let raw = clean_cell_text(&c.text().collect::<String>());
+                        if let Some(inst) = raw.strip_prefix("for ").map(|s| s.to_string()) {
+                            if !inst.is_empty() {
+                                metadata.push(MetadataBadge {
+                                    label: inst,
+                                    kind: BadgeKind::Instrument,
+                                });
+                            }
+                        }
+                    }
+                    if let Some(c) = r2_cells.get(1) {
+                        let raw = clean_cell_text(&c.text().collect::<String>());
+                        if !raw.is_empty() && raw != "n/a" {
+                            metadata.push(MetadataBadge {
+                                label: raw,
+                                kind: BadgeKind::Year,
+                            });
+                        }
+                    }
+                    if let Some(c) = r2_cells.get(2) {
+                        let raw = clean_cell_text(&c.text().collect::<String>());
+                        if !raw.is_empty() && raw != "n/a" {
+                            metadata.push(MetadataBadge {
+                                label: raw,
+                                kind: BadgeKind::Generic,
+                            });
+                        }
+                    }
+                }
                 out.push(SearchResult {
                     source: "mutopia".to_string(),
                     id,
                     title,
-                    description: None,
+                    description: composer,
                     external_url: url,
                     thumbnail_url,
+                    metadata,
                 });
             }
             out
@@ -291,3 +374,23 @@ fn decode_url(id: &str) -> Option<String> {
         .and_then(|b| String::from_utf8(b).ok())
 }
 
+/// Collapse runs of whitespace (including the `&nbsp;` chars Mutopia litters
+/// throughout the results table) into single spaces and trim. Mutopia uses
+/// a literal "&nbsp;" placeholder in empty cells; scraper renders that as
+/// U+00A0, which `trim` does not strip.
+fn clean_cell_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for c in s.chars() {
+        if c.is_whitespace() || c == '\u{00A0}' {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(c);
+            prev_space = false;
+        }
+    }
+    out.trim().to_string()
+}
