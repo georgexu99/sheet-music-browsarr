@@ -74,6 +74,13 @@ printpdf = { version = "0.9", default-features = false, features = ["png"] }
 # error paths.
 tempfile = "3"
 
+# HTML entity decoder. MuseScore's hydration JSON stores titles and
+# composer names HTML-escaped (e.g. "Pr&eacute;lude") even though the
+# JSON itself uses its own quote-escaping. We need a proper named-entity
+# decoder (the homegrown 6-entity helper covered &amp; / &quot; / etc.
+# but missed &eacute; / &ndash; / &hellip; / &lsquo; / …).
+html-escape = "0.2"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

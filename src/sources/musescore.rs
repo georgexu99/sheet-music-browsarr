@@ -814,13 +814,14 @@ fn find_hydration_json(html: &str) -> Option<String> {
     None
 }
 
+/// Decode HTML entities — both named (`&eacute;`, `&ndash;`, …) and
+/// numeric (`&#039;`, `&#x2014;`). Used in two places:
+///   1. Unescaping the `data-<hash>="…"` attribute that wraps the
+///      hydration JSON: turns `&quot;` etc. back into JSON syntax.
+///   2. Unescaping individual JSON string values (`title`,
+///      `composer_name`) which MuseScore stores in HTML-encoded form.
 fn html_unescape(s: &str) -> String {
-    s.replace("&quot;", "\"")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&#039;", "'")
-        .replace("&apos;", "'")
+    html_escape::decode_html_entities(s).into_owned()
 }
 
 fn extract_score_meta(html: &str) -> Option<ScoreMeta> {
@@ -857,12 +858,17 @@ fn extract_search_scores(html: &str) -> Option<Vec<SearchScore>> {
     let mut out = Vec::with_capacity(scores.len());
     for s in scores {
         let id = s.get("id").and_then(|x| x.as_u64())?;
-        let title = s.get("title").and_then(|x| x.as_str())?.to_string();
+        // MuseScore's hydration JSON stores user-facing text HTML-escaped
+        // even inside JSON string values, so titles come through as
+        // "Pr&eacute;lude…" and "Sonata &ndash; First Movement". Decode
+        // here so the rest of the pipeline (caching, dedup, render) sees
+        // the real text.
+        let title = html_unescape(s.get("title").and_then(|x| x.as_str())?);
         let composer_name = s
             .get("composer_name")
             .and_then(|x| x.as_str())
             .filter(|s| !s.is_empty())
-            .map(String::from);
+            .map(html_unescape);
         let href = s
             .get("href")
             .and_then(|x| x.as_str())
