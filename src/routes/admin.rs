@@ -17,6 +17,7 @@ use tokio::io::AsyncWriteExt;
 use tower_sessions::Session;
 
 use crate::audit;
+use crate::settings;
 
 use super::AppState;
 
@@ -37,11 +38,25 @@ struct LibraryRow {
     added_at: String,
 }
 
+#[derive(Template)]
+#[template(path = "admin/settings.html")]
+struct AdminSettings {
+    smtp_host: String,
+    smtp_port: String,
+    smtp_user: String,
+    smtp_from: String,
+    smtp_pass_set: bool,
+    turnstile_site_key: String,
+    turnstile_secret_set: bool,
+    message: Option<String>,
+}
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/admin", get(index))
         .route("/admin/library", get(library_get))
         .route("/admin/library/add", post(library_add))
+        .route("/admin/settings", get(settings_get).post(settings_post))
         .route_layer(middleware::from_fn(require_admin))
 }
 
@@ -251,4 +266,87 @@ fn sanitize_filename(s: &str) -> String {
         .collect::<String>()
         .trim()
         .to_string()
+}
+
+async fn settings_get(State(state): State<AppState>) -> impl IntoResponse {
+    render_settings(&state, None).await
+}
+
+#[derive(Deserialize)]
+struct SettingsForm {
+    #[serde(default)]
+    smtp_host: String,
+    #[serde(default)]
+    smtp_port: String,
+    #[serde(default)]
+    smtp_user: String,
+    #[serde(default)]
+    smtp_pass: String,
+    #[serde(default)]
+    smtp_from: String,
+    #[serde(default)]
+    turnstile_site_key: String,
+    #[serde(default)]
+    turnstile_secret_key: String,
+}
+
+async fn settings_post(
+    State(state): State<AppState>,
+    Form(form): Form<SettingsForm>,
+) -> Response {
+    let pairs: Vec<(&str, &str, bool)> = vec![
+        (settings::SMTP_HOST, form.smtp_host.trim(), true),
+        (settings::SMTP_PORT, form.smtp_port.trim(), true),
+        (settings::SMTP_USER, form.smtp_user.trim(), true),
+        (settings::SMTP_FROM, form.smtp_from.trim(), true),
+        (settings::TURNSTILE_SITE_KEY, form.turnstile_site_key.trim(), true),
+        // Secret fields: only write if the user typed something (preserves existing on blank).
+        (settings::SMTP_PASS, form.smtp_pass.as_str(), !form.smtp_pass.is_empty()),
+        (
+            settings::TURNSTILE_SECRET_KEY,
+            form.turnstile_secret_key.as_str(),
+            !form.turnstile_secret_key.is_empty(),
+        ),
+    ];
+
+    for (key, value, should_write) in pairs {
+        if !should_write {
+            continue;
+        }
+        if let Err(e) = settings::set(&state.pool, &state.secrets, key, value).await {
+            tracing::warn!(error = %e, key, "settings write failed");
+            return render_settings(&state, Some(format!("Failed to save {key}: {e}"))).await.into_response();
+        }
+    }
+
+    render_settings(&state, Some("Saved.".to_string())).await.into_response()
+}
+
+async fn render_settings(state: &AppState, message: Option<String>) -> AdminSettings {
+    let smtp_host = settings::get(&state.pool, settings::SMTP_HOST).await.unwrap_or_default();
+    let smtp_port = settings::get(&state.pool, settings::SMTP_PORT).await.unwrap_or_default();
+    let smtp_user = settings::get(&state.pool, settings::SMTP_USER).await.unwrap_or_default();
+    let smtp_from = settings::get(&state.pool, settings::SMTP_FROM).await.unwrap_or_default();
+    let smtp_pass_set = settings::get(&state.pool, settings::SMTP_PASS)
+        .await
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    let turnstile_site_key = settings::get(&state.pool, settings::TURNSTILE_SITE_KEY)
+        .await
+        .unwrap_or_default();
+    let turnstile_secret_set = settings::get(&state.pool, settings::TURNSTILE_SECRET_KEY)
+        .await
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+
+    AdminSettings {
+        smtp_host,
+        smtp_port,
+        smtp_user,
+        smtp_from,
+        smtp_pass_set,
+        turnstile_site_key,
+        turnstile_secret_set,
+        message,
+    }
 }

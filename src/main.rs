@@ -11,8 +11,13 @@ mod audit;
 mod auth;
 mod config;
 mod db;
+mod email;
+mod rate_limit;
 mod routes;
+mod secrets;
+mod settings;
 mod sources;
+mod turnstile;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,9 +40,11 @@ async fn main() -> anyhow::Result<()> {
         .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
 
     let imslp = sources::imslp::Imslp::new()?;
+    let secrets = secrets::Secrets::new(&cfg.secret_key)?;
     let state = routes::AppState {
         pool,
         imslp,
+        secrets,
         library_path: cfg.library_path.clone(),
     };
 

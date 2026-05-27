@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav>
+  <a href="/">&larr; Search</a>
+</nav>
+<p>{{ message }}</p>
+{% if !query.is_empty() %}
+  <p><a href="/search?q={{ query }}">Back to results for &ldquo;{{ query }}&rdquo;</a></p>
+{% endif %}
+{% endblock %}

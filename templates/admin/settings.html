@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}Settings &mdash; sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav>
+  <a href="/">Search</a>
+  <a href="/admin">Admin</a>
+  <a href="/admin/library">Library</a>
+  <a href="/admin/settings">Settings</a>
+  <form method="post" action="/logout" class="inline">
+    <button type="submit">Sign out</button>
+  </form>
+</nav>
+<h1>Settings</h1>
+
+{% match message %}
+  {% when Some with (msg) %}
+    <p class="error">{{ msg }}</p>
+  {% when None %}
+{% endmatch %}
+
+<form method="post" action="/admin/settings">
+  <h2>Cloudflare Turnstile</h2>
+  <p>Generate a site key + secret key at <a href="https://dash.cloudflare.com/?to=/:account/turnstile" target="_blank" rel="noopener">dash.cloudflare.com/?to=/:account/turnstile</a>. Add <code>music.&lt;your-domain&gt;</code> as the allowed hostname.</p>
+  <label>Site key
+    <input type="text" name="turnstile_site_key" value="{{ turnstile_site_key }}" autocomplete="off">
+  </label>
+  <label>Secret key {% if turnstile_secret_set %}<small>(currently set &mdash; leave blank to keep)</small>{% endif %}
+    <input type="password" name="turnstile_secret_key" autocomplete="off" placeholder="{% if turnstile_secret_set %}**********{% else %}not set{% endif %}">
+  </label>
+
+  <h2>SMTP</h2>
+  <p>For Gmail, use <code>smtp.gmail.com</code> port <code>587</code> with an app password. The "from" address must match the SMTP user.</p>
+  <label>Host
+    <input type="text" name="smtp_host" value="{{ smtp_host }}" placeholder="smtp.gmail.com" autocomplete="off">
+  </label>
+  <label>Port
+    <input type="number" name="smtp_port" value="{{ smtp_port }}" placeholder="587" autocomplete="off">
+  </label>
+  <label>User
+    <input type="text" name="smtp_user" value="{{ smtp_user }}" placeholder="you@gmail.com" autocomplete="off">
+  </label>
+  <label>Password {% if smtp_pass_set %}<small>(currently set &mdash; leave blank to keep)</small>{% endif %}
+    <input type="password" name="smtp_pass" autocomplete="new-password" placeholder="{% if smtp_pass_set %}**********{% else %}not set{% endif %}">
+  </label>
+  <label>From address
+    <input type="email" name="smtp_from" value="{{ smtp_from }}" placeholder="you@gmail.com" autocomplete="off">
+  </label>
+
+  <button type="submit">Save</button>
+</form>
+{% endblock %}

@@ -2,6 +2,7 @@ pub struct Config {
     pub port: u16,
     pub db_path: String,
     pub library_path: String,
+    pub secret_key: String,
     pub admin_password_init: Option<String>,
     pub secure_cookies: bool,
 }
@@ -19,6 +20,9 @@ impl Config {
         let library_path = std::env::var("BROWSARR_LIBRARY_PATH")
             .unwrap_or_else(|_| "./library".to_string());
 
+        let secret_key = std::env::var("BROWSARR_SECRET_KEY")
+            .map_err(|_| anyhow::anyhow!("BROWSARR_SECRET_KEY is required (>=16 chars, used to encrypt secrets at rest)"))?;
+
         let admin_password_init = std::env::var("BROWSARR_ADMIN_PASSWORD")
             .ok()
             .filter(|s| !s.is_empty());
@@ -32,6 +36,7 @@ impl Config {
             port,
             db_path,
             library_path,
+            secret_key,
             admin_password_init,
             secure_cookies,
         })

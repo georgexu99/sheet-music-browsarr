@@ -17,6 +17,23 @@
           &middot;
           <a href="{{ r.external_url }}" target="_blank" rel="noopener">View on IMSLP</a>
         </div>
+        {% match turnstile_site_key %}
+          {% when Some with (site_key) %}
+            <details class="email-form">
+              <summary>Email me this PDF</summary>
+              <form method="post" action="/email">
+                <input type="hidden" name="imslp_id" value="{{ r.id }}">
+                <input type="hidden" name="title" value="{{ r.title }}">
+                <input type="hidden" name="query" value="{{ query }}">
+                <label>Email
+                  <input type="email" name="recipient" required>
+                </label>
+                <div class="cf-turnstile" data-sitekey="{{ site_key }}"></div>
+                <button type="submit">Send</button>
+              </form>
+            </details>
+          {% when None %}
+        {% endmatch %}
       </li>
     {% endfor %}
   </ul>

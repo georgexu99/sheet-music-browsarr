@@ -6,14 +6,40 @@
   <a href="/login">Admin</a>
 </nav>
 <h1>Sheet music search</h1>
+
+{% match message %}
+  {% when Some with (msg) %}
+    <p class="error">{{ msg }}</p>
+  {% when None %}
+{% endmatch %}
+
 <form hx-get="/search" hx-target="#results" hx-push-url="true">
   <label>Search
     <input type="search" name="q" value="{{ query }}" placeholder="composer, piece, opus..." autofocus>
   </label>
   <button type="submit">Search</button>
 </form>
+
 <div id="results">
   {% include "search_results.html" %}
 </div>
+
 <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
+{% match turnstile_site_key %}
+  {% when Some with (_) %}
+    <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+    <script>
+      document.body.addEventListener('htmx:afterSwap', function (evt) {
+        if (window.turnstile && evt.detail && evt.detail.target) {
+          evt.detail.target.querySelectorAll('.cf-turnstile:not([data-rendered])').forEach(function (el) {
+            try {
+              turnstile.render(el);
+              el.setAttribute('data-rendered', '1');
+            } catch (e) {}
+          });
+        }
+      });
+    </script>
+  {% when None %}
+{% endmatch %}
 {% endblock %}
