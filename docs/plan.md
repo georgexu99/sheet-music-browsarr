@@ -459,6 +459,12 @@ Then `cloudflared tunnel route dns <tunnel-id> music.<your-domain>`. No Cloudfla
 
 Each phase is independently shippable.
 
+### Status (as of 2026-05-27)
+
+**Shipped to `main` and deployed:** Phases 0, 1, 2, 3, plus a chunk of work that wasn't in the original phasing (the multi-source refactor, Mutopia, MuseScore, server cache, typeahead UI patterns, fuzzy alias matching — all described under "Shipped beyond the original plan" below).
+
+**Deferred / potential extensions:** Phases 4, 5, 6, 7, 8. The catalog gap they would fill (method books, fake books, modern transcriptions beyond MuseScore's user uploads, choral/orchestral parts not in IMSLP) is real but narrow for the typical "I want Chopin's Nocturne" use case. Decision to defer reached after evaluating cost (~2 weekends + permanent operational tax of stateful workers + Whatbox/qBit/rsync flakiness) vs. benefit (catalog extension for a niche of repertoire that MuseScore already partially covers). Revisit when concrete missing-catalog queries pile up in the audit log.
+
 ### Phase 0 — Skeleton (target: 1 evening)
 - `cargo new sheet-music-browsarr`, wire `axum + sqlx + askama + tower-sessions`
 - Empty migrations, healthz, admin login
@@ -485,12 +491,31 @@ Each phase is independently shippable.
 
 **Verify**: submit your own email → arrives with PDF; hammer it from a script and watch quotas reject after the threshold; audit log shows the attempts.
 
-### Phase 3 — Multilingual search (target: 1 weekend)
-- `i18n/` module + alias CSV + OpenCC + jieba + pinyin crates wired
-- Search pipeline expands query → queries IMSLP with each variant in parallel → merges
-- Tests: `xiaobang`, `肖邦`, `蕭邦`, `Chopin` all return Chopin results
+### Phase 3 — Multilingual search (target: 1 weekend) — SHIPPED
+- `src/i18n/` module + `assets/zh_aliases.csv` (~60 curated rows: composers, instruments, common form names with `en, simplified, traditional, pinyin` columns)
+- Search pipeline tokenises the query, looks each token up in the alias index, emits up to 4 script variants, fans out (source × variant) in parallel, dedupes results by `(source, id)`
+- Pure-Rust implementation — `OpenCC` (C library) and `jieba` / `pinyin` (heavier deps) deferred. Free-form CJK without whitespace and phonetic Pinyin-to-unknown-word conversion are known limitations
+- Bonus: Damerau-Levenshtein fuzzy fallback on the alias lookup ("Chpin", "Bethovan" still match), inline tests for both exact and fuzzy paths
 
-**Verify**: each of the four query forms produces non-empty, overlapping results.
+---
+
+## Shipped beyond the original plan
+
+These pieces weren't on the original phasing but landed during build-out. Listed here so the deferred-phases section below isn't read as "everything else not yet done".
+
+- **Multi-source refactor.** `src/sources/mod.rs` defines an async `Source` trait (`id`, `display_name`, `external_url`, `search`, `fetch_pdf_bytes`); `AppState` holds `Vec<Arc<dyn Source>>`; the search and PDF routes generalise on a `source_id` path-param. New sources are drop-in additions.
+- **Mutopia source.** Scrapes the classic CGI search HTML; base64-encodes the direct PDF URL as the public id so single-segment path params stay clean.
+- **MuseScore source.** Server-side port of the `musescore-downloader` browser extension's technique: fetch a score page → extract the webpack bundle URL → download and parse the bundle → locate the MD5 module via `_digestsize`/`_blocksize` literals → surgically rewrite it into a callable `window.generateToken` → execute it in `boa_engine` (pure-Rust JS runtime, chosen over rquickjs to avoid the C-compiler dep) to mint per-request tokens → call `/api/jmuse` with the token → fetch per-page PNGs → stitch into a single PDF with `printpdf`. The prepared script is cached by bundle URL; only re-prepares on MuseScore deploys. Tradeoffs: fragile by design (the regex matches MuseScore's specific minified output), no direct server-side PDF available for free user uploads (hence the PNG-stitch approach).
+- **Server-side search cache** (`moka`). Per `(source_id, query_variant)` tuple, 60 s TTL, 1000-entry LRU cap. Cross-user repeat queries hit memory; protects rate-limited upstreams (especially IMSLP, which our Phase 3 fan-out amplifies 4×).
+- **Typeahead UI patterns.** HTMX `hx-trigger="keyup changed delay:300ms"` for debounce, `hx-sync this:replace` for race-condition cancellation, `hx-indicator` for a fade-in "Searching…" affordance, 2-char minimum on the server, `Cache-Control: public, max-age=60` for browser caching. Patterns lifted from the Databricks FE-SYS typeahead playbook.
+- **CI → Portainer redeploy webhook.** `gh secret PORTAINER_WEBHOOK_URL` + a final `curl -X POST` step in `release.yml`. Push to main → build → publish to `ghcr.io` → POST webhook → Portainer pulls and recreates the container. `pull_policy: always` in compose makes the redeploy actually fetch fresh.
+- **IMSLP disclaimer handling.** Two-hop fetch: when the work-page scraper finds a `Special:ImagefromIndex/...` URL (disclaimer-gated), the source follows it once and scrapes the embedded CDN URL out of the disclaimer page itself. Pre-seeded `imslpdisclaim` accept cookie as a belt-and-suspenders. `Content-Type` check on the upstream response so HTML-disguised-as-PDF can't be served to the browser.
+
+---
+
+## Deferred — potential extensions (not started)
+
+These remain valuable on paper; revisit when audit-log evidence shows the missing catalog is worth the build-and-maintain cost. The plan stays here as a reference for the future you who wants to extend the app rather than spec it from scratch.
 
 ### Phase 4 — Torznab indexer support (admin-only initially) (target: 1 weekend)
 - `/admin/indexers` CRUD
