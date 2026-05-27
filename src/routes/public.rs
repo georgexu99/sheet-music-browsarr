@@ -4,7 +4,7 @@ use askama::Template;
 use askama_axum::IntoResponse;
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue};
 use axum::response::{Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Form, Router};
@@ -175,21 +175,23 @@ async fn pdf_imslp(
     let ip = audit::client_ip(&headers);
     let ua = audit::user_agent(&headers);
 
+    let imslp_wiki = format!("https://imslp.org/wiki/{}", id);
+
     let url = match state.imslp.fetch_pdf_url(&id).await {
         Ok(u) => u,
         Err(e) => {
-            tracing::warn!(error = %e, id = %id, "imslp pdf url resolve failed");
+            tracing::warn!(error = %e, id = %id, "imslp pdf url resolve; falling back to wiki redirect");
             audit::record(
                 &state.pool,
                 &ip,
                 ua.as_deref(),
                 "pdf_imslp",
                 Some(&id),
-                "no_pdf_link",
+                "no_pdf_link_redirect",
                 None,
             )
             .await;
-            return (StatusCode::NOT_FOUND, "PDF not found").into_response();
+            return Redirect::to(&imslp_wiki).into_response();
         }
     };
 
@@ -203,11 +205,11 @@ async fn pdf_imslp(
                 ua.as_deref(),
                 "pdf_imslp",
                 Some(&id),
-                "upstream_unreachable",
+                "upstream_unreachable_redirect",
                 None,
             )
             .await;
-            return (StatusCode::BAD_GATEWAY, "upstream fetch failed").into_response();
+            return Redirect::to(&imslp_wiki).into_response();
         }
     };
 
@@ -219,11 +221,40 @@ async fn pdf_imslp(
             ua.as_deref(),
             "pdf_imslp",
             Some(&id),
-            &format!("upstream_{}", status.as_u16()),
+            &format!("upstream_{}_redirect", status.as_u16()),
             None,
         )
         .await;
-        return (StatusCode::BAD_GATEWAY, "upstream error").into_response();
+        return Redirect::to(&imslp_wiki).into_response();
+    }
+
+    // Verify upstream actually gave us a PDF. The IMSLP disclaimer interstitial
+    // returns 200 with HTML; passing that through as application/pdf produces
+    // the dreaded "Failed to load PDF document" in the browser.
+    let upstream_ct = upstream
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if !upstream_ct.starts_with("application/pdf") {
+        tracing::warn!(
+            id = %id,
+            resolved_url = %url,
+            content_type = %upstream_ct,
+            "upstream did not return a PDF; redirecting to IMSLP wiki page"
+        );
+        audit::record(
+            &state.pool,
+            &ip,
+            ua.as_deref(),
+            "pdf_imslp",
+            Some(&id),
+            &format!("non_pdf_content_type_redirect:{upstream_ct}"),
+            None,
+        )
+        .await;
+        return Redirect::to(&imslp_wiki).into_response();
     }
 
     let mut out_headers = HeaderMap::new();
@@ -433,6 +464,16 @@ async fn fetch_pdf_bytes(imslp: &Imslp, id: &str) -> anyhow::Result<Vec<u8>> {
         .send()
         .await?
         .error_for_status()?;
+    let ct = resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    anyhow::ensure!(
+        ct.starts_with("application/pdf"),
+        "upstream returned {ct:?} (not a PDF); IMSLP disclaimer may be blocking"
+    );
     if let Some(len) = resp.content_length() {
         anyhow::ensure!(
             (len as usize) <= MAX_PDF_BYTES,

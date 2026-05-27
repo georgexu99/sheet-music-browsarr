@@ -160,6 +160,20 @@ async fn library_add(
         tracing::warn!(status = %resp.status(), "library add: upstream not ok");
         return render_library_with_message(&state, "Upstream returned error").await;
     }
+    let ct = resp
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+    if !ct.starts_with("application/pdf") {
+        tracing::warn!(content_type = %ct, url = %url, "library add: upstream is not a PDF (likely IMSLP disclaimer)");
+        return render_library_with_message(
+            &state,
+            "IMSLP returned a disclaimer page instead of a PDF. The pre-seeded accept cookies didn't match — try a different IMSLP page id, or open the page on imslp.org once to confirm a PDF is actually available.",
+        )
+        .await;
+    }
 
     let mut size: i64 = 0;
     let mut file = match fs::File::create(&path).await {
