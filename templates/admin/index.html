@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Admin &mdash; sheet-music-browsarr{% endblock %}
+{% block content %}
+<nav>
+  <a href="/">Home</a>
+  <a href="/admin">Admin</a>
+  <form method="post" action="/logout" class="inline">
+    <button type="submit">Sign out</button>
+  </form>
+</nav>
+<h1>Welcome</h1>
+<p>sheet-music-browsarr is alive. Phase 0 skeleton.</p>
+<p>Next phases will fill in search, library, queue, indexer config, and the public-facing surfaces.</p>
+{% endblock %}

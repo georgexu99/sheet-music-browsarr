@@ -1,0 +1,51 @@
+use std::net::SocketAddr;
+
+use axum::Router;
+use tower_http::compression::CompressionLayer;
+use tower_http::trace::TraceLayer;
+use tower_sessions::{Expiry, SessionManagerLayer};
+use tower_sessions_sqlx_store::SqliteStore;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+mod auth;
+mod config;
+mod db;
+mod routes;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer().json())
+        .init();
+
+    let cfg = config::Config::from_env()?;
+
+    let pool = db::init_pool(&cfg.db_path).await?;
+    db::run_migrations(&pool).await?;
+    auth::ensure_admin_user(&pool, cfg.admin_password_init.as_deref()).await?;
+
+    let session_store = SqliteStore::new(pool.clone());
+    session_store.migrate().await?;
+
+    let session_layer = SessionManagerLayer::new(session_store)
+        .with_secure(cfg.secure_cookies)
+        .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
+
+    let state = routes::AppState { pool };
+
+    let app = Router::new()
+        .merge(routes::public::router())
+        .merge(routes::admin::router())
+        .with_state(state)
+        .layer(session_layer)
+        .layer(CompressionLayer::new())
+        .layer(TraceLayer::new_for_http());
+
+    let addr = SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    tracing::info!(%addr, "sheet-music-browsarr listening");
+
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}

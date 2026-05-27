@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}sheet-music-browsarr{% endblock %}</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #111; }
+    h1 { font-size: 1.5rem; margin-top: 0; }
+    nav { display: flex; gap: 1rem; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #e5e7eb; }
+    nav a { color: #1f2937; text-decoration: none; }
+    nav a:hover { text-decoration: underline; }
+    .error { color: #b91c1c; }
+    label { display: block; margin: 0.75rem 0; }
+    input { font-size: 1rem; padding: 0.5rem; width: 100%; box-sizing: border-box; border: 1px solid #d1d5db; border-radius: 4px; }
+    button { font-size: 1rem; padding: 0.5rem 1rem; background: #1f2937; color: white; border: 0; border-radius: 4px; cursor: pointer; }
+    button:hover { background: #111827; }
+    form.inline { display: inline; }
+    form.inline button { background: transparent; color: #1f2937; padding: 0; }
+    form.inline button:hover { text-decoration: underline; background: transparent; }
+  </style>
+</head>
+<body>
+  {% block content %}{% endblock %}
+</body>
+</html>

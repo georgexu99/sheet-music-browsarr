@@ -1,0 +1,27 @@
+# Drop this into Dockge / Portainer on the TerraMaster.
+# Replace georgexu99 in the image tag once your GH repo is set up.
+# Generate BROWSARR_SECRET_KEY with `openssl rand -hex 32` and set
+# BROWSARR_ADMIN_PASSWORD only on first start; remove it from the env after the
+# admin row is seeded (the password is now stored argon2-hashed in the DB).
+
+services:
+  sheet-music-browsarr:
+    image: ghcr.io/georgexu99/sheet-music-browsarr:latest
+    container_name: sheet-music-browsarr
+    restart: unless-stopped
+    ports:
+      - "8686:8686"
+    environment:
+      TZ: America/Los_Angeles
+      PUID: "1000"
+      PGID: "1000"
+      BROWSARR_PORT: "8686"
+      BROWSARR_DB_PATH: /config/sheet-music-browsarr.db
+      BROWSARR_LIBRARY_PATH: /library
+      BROWSARR_SECURE_COOKIES: "1"
+      BROWSARR_SECRET_KEY: "${BROWSARR_SECRET_KEY}"
+      BROWSARR_ADMIN_PASSWORD: "${BROWSARR_ADMIN_PASSWORD}"
+      RUST_LOG: sheet_music_browsarr=info,tower_http=info
+    volumes:
+      - /Volume1/docker/sheet-music-browsarr/config:/config
+      - /Volume1/media/sheet-music:/library
