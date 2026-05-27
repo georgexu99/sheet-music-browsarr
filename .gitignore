@@ -7,3 +7,7 @@
 .env
 .env.*
 !.env.example
+
+# Per-user Claude Code settings (not committed; team-wide
+# settings should live in .claude/settings.json instead).
+.claude/settings.local.json
