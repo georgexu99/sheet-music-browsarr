@@ -48,3 +48,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Trigger Portainer redeploy
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: curl -fSs -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}"
