@@ -58,6 +58,20 @@
   details > summary::-webkit-details-marker {
     display: none;
   }
+
+  /* Suppress the browser-native clear button on <input type="search">.
+   * Chrome and Safari add a small ✕ at the right edge whenever the
+   * field has content, which collides with our own custom clear
+   * button + the HTMX in-progress spinner (three icons stacked at
+   * the right edge of the search input). Firefox doesn't paint a
+   * native clear button, so it's unaffected. */
+  input[type="search"]::-webkit-search-cancel-button,
+  input[type="search"]::-webkit-search-decoration,
+  input[type="search"]::-webkit-search-results-button,
+  input[type="search"]::-webkit-search-results-decoration {
+    -webkit-appearance: none;
+    appearance: none;
+  }
 }
 
 @layer components {
