@@ -63,6 +63,20 @@
         <path d="M18 6 6 18M6 6l12 12"/>
       </svg>
     </button>
+    {# Ctrl/Cmd-K hint badge. Visible only when the input is empty
+       (peer-placeholder-shown), and hidden on tiny screens where the
+       affordance doesn't apply (no physical keyboard). The label flips
+       between "Ctrl" and "⌘" client-side based on navigator.platform —
+       see the script at the bottom of the page. pointer-events-none so
+       a click on the badge passes through to the input behind. #}
+    <span
+      id="search-kbd-hint"
+      class="hidden sm:peer-placeholder-shown:flex absolute right-3 top-1/2 -translate-y-1/2 pointer-events-none items-center gap-1 text-xs text-gray-400 dark:text-gray-500 select-none"
+      aria-hidden="true"
+    >
+      <kbd id="search-kbd-mod" class="px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 font-sans text-[10px] leading-none">Ctrl</kbd>
+      <kbd class="px-1.5 py-0.5 rounded border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 font-sans text-[10px] leading-none">K</kbd>
+    </span>
   </div>
 
   {#
@@ -214,6 +228,16 @@
 <script src="https://unpkg.com/htmx.org@2.0.4" crossorigin="anonymous"></script>
 
 <script>
+  // Show the right modifier glyph in the kbd hint badge. Mac/iOS get ⌘;
+  // everyone else stays on "Ctrl". Done at runtime because the SSR
+  // doesn't know the client's platform.
+  (function () {
+    if (/Mac|iPhone|iPod|iPad/i.test(navigator.platform || '')) {
+      var mod = document.getElementById('search-kbd-mod');
+      if (mod) mod.textContent = '⌘';
+    }
+  })();
+
   // '/' focuses the search bar from anywhere on the page (skipped while
   // typing into another input).
   document.addEventListener('keydown', function (e) {
@@ -221,6 +245,18 @@
     var ae = document.activeElement;
     var tag = (ae && ae.tagName) || '';
     if (tag === 'INPUT' || tag === 'TEXTAREA' || (ae && ae.isContentEditable)) return;
+    e.preventDefault();
+    var input = document.querySelector('input[type="search"][name="q"]');
+    if (input) { input.focus(); input.select(); }
+  });
+
+  // Ctrl+K / Cmd+K focuses the search bar from anywhere. Unlike '/',
+  // this one wins even while typing in another input — the chord is
+  // unambiguous, and the standard expectation (Slack, GitHub, Linear)
+  // is that ⌘K is always available.
+  document.addEventListener('keydown', function (e) {
+    if (!(e.metaKey || e.ctrlKey)) return;
+    if ((e.key || '').toLowerCase() !== 'k') return;
     e.preventDefault();
     var input = document.querySelector('input[type="search"][name="q"]');
     if (input) { input.focus(); input.select(); }
