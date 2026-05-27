@@ -31,22 +31,40 @@ jobs:
         env:
           LOG_LEVEL: info
           CAPTCHA_SOLVER: none
-        options: >-
-          --shm-size=2gb
-          --health-cmd "wget -qO- http://localhost:8191/ | grep -q 'FlareSolverr is ready'"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 12
+        # No Docker `--health-cmd` — the FS image ships neither wget nor
+        # curl, and an empty healthcheck pipe was failing the container
+        # at startup with the bare "Service container ... failed" error
+        # (GHA aborts the job before the start logs are visible). Wait
+        # for FS readiness in a dedicated step below instead, where we
+        # can use the runner host's curl + actually log the polling.
+        options: --shm-size=2gb
     env:
       # The job runs on the runner host (not inside a container), so the
       # service port is reachable via the host loopback after port mapping.
-      # `flaresolverr:8191` would also work via Docker DNS but localhost is
-      # the more universally-applicable pattern.
       FLARESOLVERR_URL: http://localhost:8191
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Wait for FlareSolverr readiness
+        # FS spins up its bundled Chromium on startup (~10–20s on the
+        # runner). Poll until /v1 returns the ready JSON or we time out.
+        # Failing this step surfaces FS startup logs cleanly via
+        # `docker logs` rather than the silent "service container
+        # failed" we hit when relying on Docker's healthcheck.
+        run: |
+          for i in $(seq 1 30); do
+            body=$(curl -sf http://localhost:8191/ || true)
+            if echo "$body" | grep -q "FlareSolverr is ready"; then
+              echo "FlareSolverr ready after ${i}s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "FlareSolverr did not become ready in 60s; dumping container logs:"
+          docker ps -a
+          docker logs $(docker ps -a --filter 'ancestor=ghcr.io/flaresolverr/flaresolverr:v3.3.21' --format '{{.ID}}' | head -n1) || true
+          exit 1
       - name: cargo test musescore_smoke (ignored)
         # `--ignored` is a libtest filter and must follow the `--` separator;
         # cargo itself doesn't accept it as a top-level flag.
