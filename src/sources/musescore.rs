@@ -8,6 +8,7 @@ use printpdf::{Mm, Op, PdfDocument, PdfPage, PdfSaveOptions, RawImage, XObjectTr
 use reqwest::cookie::Jar;
 use reqwest::header::{self, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Url};
+use scraper::{Html, Selector};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
@@ -445,40 +446,51 @@ impl Source for Musescore {
         };
         let html = self.fetch_html_challenged(&url, "search").await?;
 
+        // Two-tier extraction:
+        //   1. SSR hydration JSON, when we can get it (cookie-replay path
+        //      after the first FS call lands us back on the SSR shell).
+        //   2. Post-React DOM scrape, when FlareSolverr handed back the
+        //      fully-rendered page with the hydration `data-<hex>=`
+        //      attribute already stripped by client-side cleanup.
+        // We try JSON first because it carries richer metadata (pages
+        // count, instrumentations, composer); DOM scrape is leaner but
+        // sufficient for the must-have fields (id, title, href).
         let scores = match extract_search_scores(&html) {
             Some(s) => s,
-            None => {
-                // Hydration JSON not found. We need three orthogonal signals to
-                // tell apart the failure modes:
-                //   - looks_like_cf: only true on the literal interactive
-                //     challenge ("Just a moment…"). The Cloudflare bot-mgmt JS
-                //     ships on every CF-fronted page even when not challenged,
-                //     so we no longer match on `challenge-platform` /
-                //     `cf-mitigated` — those gave false positives.
-                //   - has_data_hash: `data-<60+hex>="…"` anywhere in the body.
-                //     If true, the SSR hydration shell IS present and our
-                //     parser is the bug. If false, FlareSolverr handed us a
-                //     post-React-hydration DOM where the attribute was
-                //     deleted, and we need a different extraction strategy.
-                //   - snippet_head/_tail: 1 KB from each end of the response
-                //     so we can confirm structure without dumping 300 KB to
-                //     the logs.
-                let looks_like_cf =
-                    html.contains("Just a moment") || html.contains("Attention Required");
-                let has_data_hash = scan_for_data_hash_attr(&html);
-                let snippet_head = truncate_for_log(&html, 1000);
-                let snippet_tail: String = html.chars().rev().take(1000).collect::<String>()
-                    .chars().rev().collect();
-                tracing::warn!(
-                    bytes = html.len(),
-                    looks_like_cf,
-                    has_data_hash,
-                    snippet_head = %snippet_head,
-                    snippet_tail = %snippet_tail,
-                    "musescore search hydration not found"
-                );
-                return Ok(Vec::new());
-            }
+            None => match extract_search_scores_from_dom(&html) {
+                Some(s) => {
+                    tracing::debug!(
+                        count = s.len(),
+                        "musescore: SSR hydration absent, used DOM fallback"
+                    );
+                    s
+                }
+                None => {
+                    // Both extractors failed. Capture enough structural
+                    // signal that the next iteration of the DOM scraper
+                    // knows what to look for. score_link_count tells us
+                    // whether the rendered cards are present at all;
+                    // first_card_html dumps the surrounding markup of
+                    // the earliest score-page link we found so we can
+                    // refine selectors next round.
+                    let looks_like_cf = html.contains("Just a moment")
+                        || html.contains("Attention Required");
+                    let has_data_hash = scan_for_data_hash_attr(&html);
+                    let (score_link_count, first_card_html) =
+                        diagnose_score_links(&html);
+                    let snippet_head = truncate_for_log(&html, 1000);
+                    tracing::warn!(
+                        bytes = html.len(),
+                        looks_like_cf,
+                        has_data_hash,
+                        score_link_count,
+                        first_card_html = %first_card_html,
+                        snippet_head = %snippet_head,
+                        "musescore search: neither JSON nor DOM extraction matched"
+                    );
+                    return Ok(Vec::new());
+                }
+            },
         };
 
         let mut results = Vec::with_capacity(scores.len().min(limit));
@@ -924,6 +936,120 @@ fn html_unescape(s: &str) -> String {
 /// Cloudflare challenge page doesn't flood the logs.
 fn truncate_for_log(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// DOM-based fallback extractor for the case where FlareSolverr returned
+/// the post-React-hydration DOM and MuseScore's client code already
+/// stripped the SSR `data-<hex>=…` attribute. We find every `<a>` element
+/// pointing at `/scores/<digits>`, dedupe by score id, and emit a leaner
+/// `SearchScore` (no pages_count / instrumentations — those only existed
+/// in the JSON). Order is document order; on MuseScore search results
+/// pages the result cards come before "related" / "featured" sections,
+/// so naïve doc-order + dedup is good enough.
+fn extract_search_scores_from_dom(html: &str) -> Option<Vec<SearchScore>> {
+    let doc = Html::parse_document(html);
+    let link_sel = Selector::parse(r#"a[href*="/scores/"]"#).ok()?;
+    let img_sel = Selector::parse("img").ok()?;
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out: Vec<SearchScore> = Vec::new();
+
+    for el in doc.select(&link_sel) {
+        let href = match el.value().attr("href") {
+            Some(h) => h,
+            None => continue,
+        };
+        let id = match parse_score_id_from_url(href) {
+            Some(id) => id,
+            None => continue,
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+
+        // Title heuristic: image alt is usually the cleanest signal (cards
+        // typically have `<img alt="<title>" />`); otherwise the anchor's
+        // concatenated text content — noisier (may include duration,
+        // composer, "Free" badge) but always present.
+        let img_alt = el
+            .select(&img_sel)
+            .next()
+            .and_then(|img| img.value().attr("alt"))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let anchor_text = el.text().collect::<String>().trim().to_string();
+        let title_raw = img_alt.unwrap_or(anchor_text);
+        if title_raw.is_empty() {
+            continue;
+        }
+
+        let thumbnail_url = el
+            .select(&img_sel)
+            .next()
+            .and_then(|img| img.value().attr("src"))
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+
+        out.push(SearchScore {
+            id,
+            title: html_unescape(&title_raw),
+            // Composer / pages / parts / instrumentations would need
+            // sibling-element heuristics we can't write without sample
+            // HTML; leave them out and the result card just won't carry
+            // metadata badges. The title + thumbnail + link to PDF is
+            // still enough for the primary user action.
+            composer_name: None,
+            href: Some(href.to_string()),
+            thumbnail_url,
+            pages_count: None,
+            parts_count: None,
+            instrumentations: vec![],
+        });
+    }
+
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Parse the numeric score id out of any URL containing `/scores/<digits>`.
+/// Handles both absolute (`https://musescore.com/user/.../scores/N`) and
+/// path-relative (`/user/.../scores/N`) forms, plus trailing `/edit`,
+/// `?query=…`, `#fragment` suffixes.
+fn parse_score_id_from_url(url: &str) -> Option<u64> {
+    let after = url.split("/scores/").nth(1)?;
+    let id_str = after.split(['/', '?', '#']).next()?;
+    id_str.parse().ok()
+}
+
+/// Diagnostic: count `<a href*="/scores/">` links and emit a HTML
+/// snippet of the FIRST match's enclosing structure. When both
+/// extractors return empty, this is what tells us whether the cards
+/// are rendered at all and what their markup looks like.
+fn diagnose_score_links(html: &str) -> (usize, String) {
+    let doc = Html::parse_document(html);
+    let Ok(sel) = Selector::parse(r#"a[href*="/scores/"]"#) else {
+        return (0, String::new());
+    };
+    let mut count = 0usize;
+    let mut first_html: Option<String> = None;
+    for el in doc.select(&sel) {
+        count += 1;
+        if first_html.is_none() {
+            // Pull the surrounding structure (parent or grandparent) so we
+            // see card wrapper classes, not just the anchor itself.
+            let outer = el
+                .parent()
+                .and_then(scraper::ElementRef::wrap)
+                .map(|p| p.html())
+                .unwrap_or_else(|| el.html());
+            first_html = Some(truncate_for_log(&outer, 1200));
+        }
+    }
+    (count, first_html.unwrap_or_default())
 }
 
 /// True iff the HTML contains a `data-<60+ hex chars>="…"` attribute —
