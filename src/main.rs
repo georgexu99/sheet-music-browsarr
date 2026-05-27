@@ -13,14 +13,10 @@ mod auth;
 mod cache;
 mod config;
 mod db;
-mod email;
 mod i18n;
-mod rate_limit;
 mod routes;
 mod secrets;
-mod settings;
 mod sources;
-mod turnstile;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

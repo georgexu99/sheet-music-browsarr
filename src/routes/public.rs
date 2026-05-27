@@ -15,14 +15,9 @@ use tower_sessions::Session;
 use crate::audit;
 use crate::auth;
 use crate::cache::{self, SearchCache};
-use crate::email::{self as email_mod, SmtpConfig};
 use crate::i18n;
-use crate::rate_limit;
-use crate::secrets::Secrets;
-use crate::settings;
 use crate::sources::health;
 use crate::sources::{Instrument, SearchFilters, SearchResult, Source};
-use crate::turnstile;
 use std::sync::Arc;
 
 use super::AppState;
@@ -52,7 +47,6 @@ const SEARCH_MIN_QUERY_LEN: usize = 2;
 struct SearchPage {
     query: String,
     results: Vec<SearchResult>,
-    turnstile_site_key: Option<String>,
     message: Option<String>,
     /// `Some(n)` when there is likely more to fetch — the trimmed result
     /// list filled the requested page exactly. `None` once we know we've
@@ -70,7 +64,6 @@ struct SearchPage {
 struct ResultsPartial {
     query: String,
     results: Vec<SearchResult>,
-    turnstile_site_key: Option<String>,
     next_page: Option<u32>,
 }
 
@@ -166,7 +159,6 @@ pub fn router() -> Router<AppState> {
         .route("/search", get(search))
         .route("/pdf/:source_id/:id", get(pdf_handler))
         .route("/thumbnail/:source_id/:id", get(thumbnail_handler))
-        .route("/email", post(email_handler))
         .route("/login", get(login_page).post(login_submit))
         .route("/logout", post(logout))
 }
@@ -263,14 +255,10 @@ async fn app_css() -> Response {
 }
 
 async fn home(State(state): State<AppState>) -> impl IntoResponse {
-    let site_key = settings::get(&state.pool, settings::TURNSTILE_SITE_KEY)
-        .await
-        .filter(|s| !s.is_empty());
     let (sources, instruments) = build_filter_options(&state, None, None);
     SearchPage {
         query: String::new(),
         results: Vec::new(),
-        turnstile_site_key: site_key,
         message: None,
         next_page: None,
         sources,
@@ -312,10 +300,6 @@ async fn search(
         .filter(|p| *p >= 1 && *p <= SEARCH_MAX_PAGE)
         .unwrap_or(1);
 
-    let site_key = settings::get(&state.pool, settings::TURNSTILE_SITE_KEY)
-        .await
-        .filter(|s| !s.is_empty());
-
     if query.is_empty() {
         audit::record(
             &state.pool,
@@ -332,7 +316,6 @@ async fn search(
             &state,
             &query,
             Vec::new(),
-            site_key,
             None,
             source_filter.as_ref(),
             instrument,
@@ -347,7 +330,6 @@ async fn search(
             &state,
             &query,
             Vec::new(),
-            site_key,
             None,
             source_filter.as_ref(),
             instrument,
@@ -480,7 +462,6 @@ async fn search(
         &state,
         &query,
         results,
-        site_key,
         next_page,
         source_filter.as_ref(),
         instrument,
@@ -495,7 +476,6 @@ fn render_response(
     state: &AppState,
     query: &str,
     results: Vec<SearchResult>,
-    site_key: Option<String>,
     next_page: Option<u32>,
     source_filter: Option<&HashSet<String>>,
     instrument: Option<Instrument>,
@@ -504,7 +484,6 @@ fn render_response(
         ResultsPartial {
             query: query.to_string(),
             results,
-            turnstile_site_key: site_key,
             next_page,
         }
         .into_response()
@@ -513,7 +492,6 @@ fn render_response(
         SearchPage {
             query: query.to_string(),
             results,
-            turnstile_site_key: site_key,
             message: None,
             next_page,
             sources,
@@ -590,246 +568,6 @@ async fn pdf_handler(
             Redirect::to(&source.external_url(&id)).into_response()
         }
     }
-}
-
-#[derive(Deserialize)]
-struct EmailForm {
-    source: String,
-    item_id: String,
-    title: String,
-    recipient: String,
-    #[serde(default, rename = "cf-turnstile-response")]
-    turnstile_token: String,
-    #[serde(default)]
-    query: String,
-}
-
-async fn email_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Form(form): Form<EmailForm>,
-) -> Response {
-    let ip = audit::client_ip(&headers);
-    let ua = audit::user_agent(&headers);
-
-    let source = match state.find_source(&form.source) {
-        Some(s) => s,
-        None => return flash(&form.query, "Unknown source."),
-    };
-
-    let secret = match settings::get_secret(
-        &state.pool,
-        &state.secrets,
-        settings::TURNSTILE_SECRET_KEY,
-    )
-    .await
-    {
-        Ok(Some(s)) if !s.is_empty() => s,
-        Ok(_) => {
-            return flash(
-                &form.query,
-                "Email isn't configured yet. The admin needs to set the Turnstile secret key.",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "turnstile secret read");
-            return flash(&form.query, "Internal error reading settings.");
-        }
-    };
-
-    // Reuse one of the sources' http clients for the Turnstile verify
-    // call — any of them will do; they all carry sane timeouts.
-    let verify_http = state
-        .sources
-        .first()
-        .and_then(|_| Some(reqwest::Client::new()))
-        .unwrap_or_default();
-    if !turnstile::verify(&verify_http, &secret, &form.turnstile_token, Some(&ip)).await {
-        audit::record(
-            &state.pool,
-            &ip,
-            ua.as_deref(),
-            "email",
-            Some(&form.recipient),
-            "turnstile_failed",
-            None,
-        )
-        .await;
-        return flash(&form.query, "Verification failed. Try again.");
-    }
-
-    if !valid_email(&form.recipient) {
-        return flash(&form.query, "Invalid email address.");
-    }
-
-    let buckets: [(String, i64); 3] = [
-        ("global:email".to_string(), rate_limit::EMAIL_GLOBAL_PER_DAY),
-        (format!("ip:{ip}:email"), rate_limit::EMAIL_PER_IP_PER_DAY),
-        (
-            format!("recipient:{}:email", form.recipient.to_lowercase()),
-            rate_limit::EMAIL_PER_RECIPIENT_PER_DAY,
-        ),
-    ];
-    for (bucket, limit) in &buckets {
-        match rate_limit::check_and_increment(&state.pool, bucket, *limit).await {
-            Ok(true) => {}
-            Ok(false) => {
-                audit::record(
-                    &state.pool,
-                    &ip,
-                    ua.as_deref(),
-                    "email",
-                    Some(&form.recipient),
-                    "rate_limited",
-                    Some(&format!(r#"{{"bucket":"{}"}}"#, bucket)),
-                )
-                .await;
-                return flash(
-                    &form.query,
-                    "Daily limit reached. Try again tomorrow or ask the admin to raise the cap.",
-                );
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "rate_limit check");
-                return flash(&form.query, "Internal error.");
-            }
-        }
-    }
-
-    let smtp_cfg = match load_smtp_config(&state.pool, &state.secrets).await {
-        Ok(Some(c)) => c,
-        Ok(None) => {
-            return flash(
-                &form.query,
-                "Email isn't configured yet. The admin needs to set SMTP credentials.",
-            );
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "smtp config load");
-            return flash(&form.query, "Internal error loading SMTP config.");
-        }
-    };
-
-    let pdf_bytes = match source.fetch_pdf_bytes(&form.item_id, MAX_PDF_BYTES).await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::warn!(error = %e, source = %form.source, id = %form.item_id, "pdf fetch for email");
-            audit::record(
-                &state.pool,
-                &ip,
-                ua.as_deref(),
-                "email",
-                Some(&form.recipient),
-                "pdf_fetch_failed",
-                None,
-            )
-            .await;
-            return flash(&form.query, "Could not fetch the PDF.");
-        }
-    };
-
-    let subject = format!("Sheet music: {}", form.title);
-    let body = format!(
-        "Sheet music from {}:\n\n{}\n\nDelivered via sheet-music-browsarr.",
-        source.display_name(),
-        form.title
-    );
-    let filename = format!("{}.pdf", sanitize_filename(&form.title));
-
-    match email_mod::send_pdf(&smtp_cfg, &form.recipient, &subject, &body, &filename, pdf_bytes)
-        .await
-    {
-        Ok(()) => {
-            audit::record(
-                &state.pool,
-                &ip,
-                ua.as_deref(),
-                "email",
-                Some(&form.recipient),
-                "ok",
-                None,
-            )
-            .await;
-            flash(
-                &form.query,
-                &format!("Sent! Check {}'s inbox.", form.recipient),
-            )
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "smtp send failed");
-            audit::record(
-                &state.pool,
-                &ip,
-                ua.as_deref(),
-                "email",
-                Some(&form.recipient),
-                "smtp_error",
-                None,
-            )
-            .await;
-            flash(&form.query, "Failed to send email (SMTP error). Try again.")
-        }
-    }
-}
-
-async fn load_smtp_config(
-    pool: &SqlitePool,
-    secrets: &Secrets,
-) -> anyhow::Result<Option<SmtpConfig>> {
-    let host = settings::get(pool, settings::SMTP_HOST).await.unwrap_or_default();
-    let port: u16 = settings::get(pool, settings::SMTP_PORT)
-        .await
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(587);
-    let user = settings::get(pool, settings::SMTP_USER).await.unwrap_or_default();
-    let pass = settings::get_secret(pool, secrets, settings::SMTP_PASS)
-        .await?
-        .unwrap_or_default();
-    let from = settings::get(pool, settings::SMTP_FROM).await.unwrap_or_default();
-
-    if host.is_empty() || user.is_empty() || pass.is_empty() || from.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(SmtpConfig {
-        host,
-        port,
-        user,
-        pass,
-        from,
-    }))
-}
-
-#[derive(Template)]
-#[template(path = "flash.html")]
-struct FlashTemplate {
-    message: String,
-    query: String,
-}
-
-fn flash(query: &str, message: &str) -> Response {
-    FlashTemplate {
-        message: message.to_string(),
-        query: query.to_string(),
-    }
-    .into_response()
-}
-
-fn valid_email(s: &str) -> bool {
-    let s = s.trim();
-    if s.len() < 3 || s.len() > 320 {
-        return false;
-    }
-    let at = match s.find('@') {
-        Some(i) => i,
-        None => return false,
-    };
-    if at == 0 || at == s.len() - 1 {
-        return false;
-    }
-    if s.chars().any(|c| c.is_whitespace()) {
-        return false;
-    }
-    s[at + 1..].contains('.')
 }
 
 fn sanitize_filename(s: &str) -> String {
