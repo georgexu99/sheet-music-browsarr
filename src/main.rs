@@ -52,12 +52,14 @@ async fn main() -> anyhow::Result<()> {
     let secrets = secrets::Secrets::new(&cfg.secret_key)?;
     let search_cache = cache::new_search_cache();
     let thumbnail_cache = cache::new_thumbnail_cache();
+    let thumbnail_bytes_cache = cache::new_thumbnail_bytes_cache();
     let state = routes::AppState {
         pool,
         sources,
         secrets,
         search_cache,
         thumbnail_cache,
+        thumbnail_bytes_cache,
         library_path: cfg.library_path.clone(),
         source_health,
     };

@@ -42,6 +42,22 @@ pub fn new_thumbnail_cache() -> ThumbnailCache {
         .build()
 }
 
+/// Server-rendered thumbnail PNG cache. Keyed by `"<source_id>:<item_id>"`.
+/// Stores `(bytes, mime_type)` for sources that generate their thumbnail
+/// inline (currently Mutopia, which rasterizes the PDF's first page via
+/// pdftoppm). Capped by entry count rather than total bytes — a typical
+/// page-1 PNG at 72 DPI is ~30–80 KB, so 500 entries is roughly 25 MB.
+pub type ThumbnailBytesCache = Cache<String, Arc<(Vec<u8>, &'static str)>>;
+
+const THUMBNAIL_BYTES_CACHE_MAX_ENTRIES: u64 = 500;
+
+pub fn new_thumbnail_bytes_cache() -> ThumbnailBytesCache {
+    Cache::builder()
+        .max_capacity(THUMBNAIL_BYTES_CACHE_MAX_ENTRIES)
+        .time_to_live(Duration::from_secs(THUMBNAIL_CACHE_TTL_SECS))
+        .build()
+}
+
 /// Cache-aside wrapper around `Source::search`. Cache miss runs the real
 /// search and inserts the result; cache hit returns the cached Vec
 /// directly (callers clone as needed for ownership).

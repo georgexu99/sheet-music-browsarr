@@ -63,4 +63,13 @@ pub trait Source: Send + Sync {
     async fn thumbnail_url(&self, _id: &str) -> anyhow::Result<String> {
         anyhow::bail!("source does not provide lazy thumbnails")
     }
+
+    /// Inline-bytes alternative to `thumbnail_url`. Used by sources whose
+    /// thumbnails are generated on demand (e.g., Mutopia rasterizing the
+    /// first PDF page) rather than served by a third party CDN. Default
+    /// implementation errors so the route can choose between redirect and
+    /// inline-bytes paths.
+    async fn thumbnail_bytes(&self, _id: &str) -> anyhow::Result<(Vec<u8>, &'static str)> {
+        anyhow::bail!("source does not provide inline thumbnails")
+    }
 }
