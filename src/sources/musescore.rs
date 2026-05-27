@@ -1069,7 +1069,7 @@ mod tests {
             std::env::var("MUSESCORE_SMOKE_QUERY").unwrap_or_else(|_| "bach".to_string());
 
         let results = m
-            .search(&query, 5)
+            .search(&query, &SearchFilters::default(), 5)
             .await
             .expect("search must not error for a stable query");
         assert!(!results.is_empty(), "search returned 0 results for {query:?}");
