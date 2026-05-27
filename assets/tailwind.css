@@ -14,8 +14,26 @@
 @source inline("{source-badge,source-badge-imslp,source-badge-mutopia,source-badge-musescore}");
 
 @theme {
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  /* Inter as the primary face. Lands a noticeably tighter look than the
+   * system-font stack on Windows/Linux, and matches what Mac users with
+   * SF Pro already get on the system fallback. Loaded once from Google
+   * Fonts in base.html with a preconnect + display=swap so the first
+   * paint doesn't block on font download. */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+@layer base {
+  /* `<details>` disclosure widget: hide the default browser marker
+   * (Chrome's right-pointing triangle / Firefox's bullet) so we can
+   * provide our own chevron. We use <details> for the Sources filter
+   * dropdown — zero-JS toggle behavior, native a11y. */
+  details > summary {
+    list-style: none;
+  }
+  details > summary::-webkit-details-marker {
+    display: none;
+  }
 }
 
 @layer components {

@@ -1,13 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Search &mdash; sheet-music-browsarr{% endblock %}
 {% block content %}
-<nav class="flex items-center gap-4 text-sm border-b border-gray-200 dark:border-gray-800 pb-3 mb-6">
-  <a href="/" class="text-gray-900 dark:text-gray-100 font-medium">Search</a>
-  <a href="/login" class="text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100">Admin</a>
-</nav>
-
-<h1 class="text-2xl font-semibold tracking-tight mb-1">Sheet music search</h1>
-<p class="text-sm text-gray-500 dark:text-gray-400 mb-6">English (Chopin), Chinese (肖邦), or Pinyin (xiaobang). Typos OK.</p>
 
 {% match message %}
   {% when Some with (msg) %}
@@ -16,75 +9,120 @@
 {% endmatch %}
 
 <form action="/search" method="get" role="search" class="mb-6">
-  <div class="flex items-center gap-2 mb-3">
+  {# Search input row. The input itself uses `relative` so we can stack
+     three things inside its right edge:
+       1. The search spinner (`htmx-indicator`, fades in during fetch).
+       2. The clear (✕) button, shown only when there's text in the
+          input. Pure CSS — `:placeholder-shown` hides it when empty.
+     The input has `pr-20` to reserve room for both. #}
+  <div class="relative mb-3">
     <input
       type="search"
       name="q"
+      id="search-input"
       value="{{ query }}"
       placeholder="composer, piece, opus, 肖邦, xiaobang…"
       autofocus
       autocomplete="off"
       aria-label="Sheet music search"
-      class="flex-1 text-base sm:text-lg px-4 py-3 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow"
+      class="peer w-full text-base sm:text-lg pl-4 pr-20 py-3 rounded-lg border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 placeholder:text-gray-400 dark:placeholder:text-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-shadow"
       hx-get="/search"
       hx-target="#results"
       hx-trigger="keyup changed delay:300ms, search, input changed delay:300ms"
       hx-include="closest form"
-      hx-indicator="#search-loading"
+      hx-indicator="#search-spinner"
       hx-sync="this:replace"
       hx-push-url="true"
     >
-    <span id="search-loading" class="htmx-indicator text-sm text-gray-500 dark:text-gray-400 px-2 whitespace-nowrap" aria-live="polite">Searching&hellip;</span>
+    {# Inline spinner — sits inside the right edge of the input, fades in
+       while HTMX is fetching, fades out after the swap. `htmx-indicator`
+       handles the opacity automatically. #}
+    <span
+      id="search-spinner"
+      class="htmx-indicator pointer-events-none absolute right-10 top-1/2 -translate-y-1/2"
+      aria-hidden="true"
+    >
+      <svg class="animate-spin w-4 h-4 text-gray-400" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="3" class="opacity-25"></circle>
+        <path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor" stroke-width="3" stroke-linecap="round"></path>
+      </svg>
+    </span>
+    {# Clear (✕) button — only visible while the input has content.
+       `:placeholder-shown` is true when the field is empty, so the
+       inverse selector (`peer-[:not(:placeholder-shown)]`) reveals the
+       button as soon as the user types. Clicking it empties the input
+       and dispatches a `change` so HTMX re-fires the search with q="". #}
+    <button
+      type="button"
+      tabindex="-1"
+      aria-label="Clear search"
+      class="hidden peer-[:not(:placeholder-shown)]:flex absolute right-2 top-1/2 -translate-y-1/2 w-7 h-7 items-center justify-center rounded-full text-gray-400 hover:text-gray-700 dark:hover:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 transition-colors"
+      onclick="var i=document.getElementById('search-input'); i.value=''; i.dispatchEvent(new Event('input',{bubbles:true})); i.focus();"
+    >
+      <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M18 6 6 18M6 6l12 12"/>
+      </svg>
+    </button>
   </div>
 
   {#
-    Filter section. Design notes:
-    - Wrapped in <fieldset>/<legend> for native a11y (screen readers
-      announce "Filters group, ...") AND because the legend sits notched
-      into the top-left of the border by default, giving us the labeled
-      card look without extra positioning markup.
-    - All controls share `h-8`, `px-3`, `text-sm`, and `rounded-full` so
-      the chip pills and the instrument dropdown sit on the same baseline
-      with identical shape language. Earlier mix of `py-1` (chips) +
-      `py-1.5` (select) + `rounded-full` vs `rounded-md` gave the row a
-      "stair-step" vertical rhythm we want gone.
-    - Source filter stays as multi-select chips on purpose. N=3, all
-      state visible at a glance, no JS needed. A single dropdown would
-      force one source at a time and lose useful combos (e.g. "IMSLP +
-      Mutopia when MuseScore is flaky").
-    - Instrument keeps its dropdown because N=10 is too tall for chips.
-      The placeholder option "Any instrument" doubles as the label so we
-      don't need a separate <span>Instrument</span> next to the control.
+    Filter row. Sources as a multi-select dropdown (<details> popover with
+    checkboxes inside) — keeps combos available while removing the visual
+    weight three always-on chips were adding. Instrument stays as a
+    dropdown. Both controls + the "Reset filters" link share the same h-8
+    pill shape so the row reads as one set of filters.
+
+    "Reset filters" is shown only when any non-default filter is active.
+    `has_active_filters` is computed in the route handler — see
+    src/routes/public.rs::build_filter_options.
   #}
-  <fieldset class="border border-gray-200 dark:border-gray-800 rounded-xl px-4 pt-2 pb-3">
-    <legend class="px-2 text-xs font-medium uppercase tracking-wider text-gray-500 dark:text-gray-400">Filters</legend>
-    <div class="flex flex-wrap items-center gap-2 text-sm">
-    <div class="flex flex-wrap items-center gap-2" role="group" aria-label="Source filter">
-      {% for s in sources %}
-        <label class="cursor-pointer">
-          <input
-            type="checkbox"
-            name="sources"
-            value="{{ s.id }}"
-            class="peer sr-only"
-            {% if s.selected %}checked{% endif %}
-            hx-get="/search"
-            hx-target="#results"
-            hx-trigger="change"
-            hx-include="closest form"
-            hx-push-url="true"
-          >
-          <span class="inline-flex items-center h-8 px-3 rounded-full border border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-400 peer-checked:bg-gray-900 peer-checked:text-white peer-checked:border-gray-900 dark:peer-checked:bg-gray-100 dark:peer-checked:text-gray-900 dark:peer-checked:border-gray-100 hover:border-gray-400 dark:hover:border-gray-500 peer-focus-visible:ring-2 peer-focus-visible:ring-blue-500 transition-colors select-none">
-            {{ s.display }}
-          </span>
-        </label>
-      {% endfor %}
-    </div>
+  <div class="flex flex-wrap items-center gap-2 text-sm">
+    <details
+      class="relative"
+      data-close-on-outside
+    >
+      <summary
+        aria-label="Source filter"
+        class="inline-flex items-center h-8 px-3 rounded-full border border-gray-300 dark:border-gray-700 text-gray-600 dark:text-gray-400 hover:border-gray-400 dark:hover:border-gray-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 transition-colors cursor-pointer select-none"
+      >
+        <span>Sources</span>
+        {# Always render the badge so client JS can flip its visibility
+           live on checkbox change. Initial `hidden` class matches the
+           server-computed count; the JS in the page-level <script>
+           keeps it in sync after user interaction. #}
+        <span
+          id="source-count-badge"
+          class="ml-1.5 inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1 rounded-full bg-gray-900 text-white text-xs font-medium dark:bg-gray-100 dark:text-gray-900 {% if selected_source_count == sources.len() %}hidden{% endif %}"
+        >{{ selected_source_count }}</span>
+        <svg class="ml-1.5 -mr-0.5 w-4 h-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+          <path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 11.06l3.71-3.83a.75.75 0 1 1 1.08 1.04l-4.25 4.39a.75.75 0 0 1-1.08 0L5.21 8.27a.75.75 0 0 1 .02-1.06z" clip-rule="evenodd"/>
+        </svg>
+      </summary>
+      <div class="absolute left-0 top-full mt-2 min-w-[12rem] bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-800 rounded-lg shadow-lg p-2 z-30">
+        {% for s in sources %}
+          <label class="flex items-center gap-2 px-2 py-1.5 rounded-md cursor-pointer hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors">
+            <input
+              type="checkbox"
+              name="sources"
+              value="{{ s.id }}"
+              {% if s.selected %}checked{% endif %}
+              class="w-4 h-4 rounded border-gray-300 dark:border-gray-600 text-gray-900 dark:text-gray-100 focus:ring-2 focus:ring-blue-500 focus:ring-offset-0"
+              hx-get="/search"
+              hx-target="#results"
+              hx-trigger="change"
+              hx-include="closest form"
+              hx-push-url="true"
+            >
+            <span class="text-sm text-gray-700 dark:text-gray-300">{{ s.display }}</span>
+          </label>
+        {% endfor %}
+      </div>
+    </details>
 
     <select
       name="instrument"
       aria-label="Instrument filter"
-      class="h-8 px-3 pr-8 rounded-full border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 hover:border-gray-400 dark:hover:border-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-colors appearance-none bg-no-repeat bg-right [background-position:right_0.5rem_center] [background-size:1.25rem] [background-image:url('data:image/svg+xml;utf8,<svg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2020%2020%22%20fill=%22currentColor%22><path%20fill-rule=%22evenodd%22%20d=%22M5.23%207.21a.75.75%200%200%201%201.06.02L10%2011.06l3.71-3.83a.75.75%200%201%201%201.08%201.04l-4.25%204.39a.75.75%200%200%201-1.08%200L5.21%208.27a.75.75%200%200%201%20.02-1.06z%22%20clip-rule=%22evenodd%22/></svg>')]"
+      class="h-8 px-3 pr-8 rounded-full border border-gray-300 dark:border-gray-700 bg-white dark:bg-gray-900 text-gray-600 dark:text-gray-400 hover:border-gray-400 dark:hover:border-gray-500 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus:border-transparent transition-colors appearance-none bg-no-repeat bg-right [background-position:right_0.5rem_center] [background-size:1.25rem] [background-image:url('data:image/svg+xml;utf8,<svg%20xmlns=%22http://www.w3.org/2000/svg%22%20viewBox=%220%200%2020%2020%22%20fill=%22currentColor%22><path%20fill-rule=%22evenodd%22%20d=%22M5.23%207.21a.75.75%200%200%201%201.06.02L10%2011.06l3.71-3.83a.75.75%200%201%201%201.08%201.04l-4.25%204.39a.75.75%200%200%201-1.08%200L5.21%208.27a.75.75%200%200%201%20.02-1.06z%22%20clip-rule=%22evenodd%22/></svg>')]"
       hx-get="/search"
       hx-target="#results"
       hx-trigger="change"
@@ -96,8 +134,16 @@
         <option value="{{ i.slug }}" {% if i.selected %}selected{% endif %}>{{ i.display }}</option>
       {% endfor %}
     </select>
-    </div>
-  </fieldset>
+
+    {# Always rendered; visibility toggled by the JS at the bottom of the
+       page so flipping a filter checkbox or instrument doesn't leave the
+       Reset link stuck on/off until full reload. #}
+    <a
+      id="reset-filters"
+      href="/search?q={{ query }}"
+      class="ml-1 text-sm text-gray-500 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100 hover:underline transition-colors {% if !has_active_filters %}hidden{% endif %}"
+    >Reset filters</a>
+  </div>
 </form>
 
 <div id="results">
@@ -118,5 +164,39 @@
     var input = document.querySelector('input[type="search"][name="q"]');
     if (input) { input.focus(); input.select(); }
   });
+
+  // Keep the Sources count badge + Reset-filters link in sync with the
+  // current checkbox / select state. The HTMX swap on filter change
+  // only re-renders `#results`, so without this the filter UI would
+  // stay frozen on its server-rendered values until a full reload.
+  (function () {
+    function recompute() {
+      var sourceInputs = document.querySelectorAll(
+        'details[data-close-on-outside] input[name="sources"]'
+      );
+      var total = sourceInputs.length;
+      var checked = 0;
+      sourceInputs.forEach(function (i) { if (i.checked) checked++; });
+
+      var badge = document.getElementById('source-count-badge');
+      if (badge) {
+        badge.textContent = checked;
+        badge.classList.toggle('hidden', checked === total);
+      }
+
+      var instr = document.querySelector('select[name="instrument"]');
+      var hasInstr = !!(instr && instr.value);
+      var hasActive = (checked < total) || hasInstr;
+
+      var reset = document.getElementById('reset-filters');
+      if (reset) reset.classList.toggle('hidden', !hasActive);
+    }
+
+    document.querySelectorAll(
+      'details[data-close-on-outside] input[name="sources"], select[name="instrument"]'
+    ).forEach(function (el) {
+      el.addEventListener('change', recompute);
+    });
+  })();
 </script>
 {% endblock %}

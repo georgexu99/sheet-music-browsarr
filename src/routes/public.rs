@@ -64,6 +64,16 @@ struct SearchPage {
     next_page: Option<u32>,
     sources: Vec<SourceFilterOption>,
     instruments: Vec<InstrumentFilterOption>,
+    /// How many source checkboxes are currently ticked. Drives the count
+    /// badge next to "Sources ▾" in the filter dropdown ("Sources [2]"
+    /// when not all are selected). Live-updated by a small JS in
+    /// search.html on checkbox change since the HTMX swap only updates
+    /// `#results`, not the filter UI.
+    selected_source_count: usize,
+    /// True iff any filter is set to a non-default value (instrument
+    /// chosen, or at least one source unchecked). Drives the visibility
+    /// of the "Reset filters" link.
+    has_active_filters: bool,
 }
 
 #[derive(Template)]
@@ -275,11 +285,15 @@ async fn app_css() -> Response {
 
 async fn home(State(state): State<AppState>) -> impl IntoResponse {
     let (sources, instruments) = build_filter_options(&state, None, None);
+    // Home page: no filters set, every source ticked, no instrument.
+    let selected_source_count = sources.len();
     SearchPage {
         query: String::new(),
         results: Vec::new(),
         message: None,
         next_page: None,
+        selected_source_count,
+        has_active_filters: false,
         sources,
         instruments,
     }
@@ -559,11 +573,18 @@ fn render_response(
         .into_response()
     } else {
         let (sources, instruments) = build_filter_options(state, source_filter, instrument);
+        let selected_source_count = sources.iter().filter(|s| s.selected).count();
+        // "Active" = anything diverging from the home-page default (all
+        // sources ticked, no instrument). Drives the Reset-filters link.
+        let has_active_filters =
+            selected_source_count < sources.len() || instrument.is_some();
         SearchPage {
             query: query.to_string(),
             results,
             message: None,
             next_page,
+            selected_source_count,
+            has_active_filters,
             sources,
             instruments,
         }
