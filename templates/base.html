@@ -4,11 +4,76 @@
   <meta charset="utf-8">
   <title>{% block title %}sheet-music-browsarr{% endblock %}</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script>
+    // Apply the saved theme BEFORE any content paints, to avoid a flash of
+    // wrong theme. Reads localStorage.theme first; otherwise falls back to
+    // the OS preference via prefers-color-scheme.
+    (function () {
+      try {
+        var stored = localStorage.getItem('theme');
+        var prefersDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+        var isDark = stored === 'dark' || (stored === null && prefersDark);
+        document.documentElement.classList.toggle('dark', isDark);
+      } catch (e) { /* localStorage may be unavailable; ignore */ }
+    })();
+  </script>
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body class="min-h-full bg-white text-gray-900 dark:bg-gray-950 dark:text-gray-100 antialiased font-sans">
+  <button
+    type="button"
+    id="theme-toggle"
+    aria-label="Toggle dark mode"
+    aria-pressed="false"
+    title="Toggle dark mode"
+    class="fixed top-3 right-3 z-50 inline-flex items-center justify-center w-9 h-9 rounded-md border border-gray-200 dark:border-gray-800 bg-white/80 dark:bg-gray-900/80 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-500 backdrop-blur transition-colors"
+  >
+    <!-- Sun (visible in dark mode, click to go light) -->
+    <svg class="hidden dark:block w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <circle cx="12" cy="12" r="4"></circle>
+      <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path>
+    </svg>
+    <!-- Moon (visible in light mode, click to go dark) -->
+    <svg class="block dark:hidden w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+    </svg>
+  </button>
   <main class="max-w-3xl mx-auto px-4 py-8">
     {% block content %}{% endblock %}
   </main>
+  <script>
+    // Wire up the toggle and (optionally) follow OS changes when the user
+    // hasn't explicitly chosen.
+    (function () {
+      var root = document.documentElement;
+      var btn = document.getElementById('theme-toggle');
+
+      function syncPressed() {
+        if (btn) btn.setAttribute('aria-pressed', root.classList.contains('dark') ? 'true' : 'false');
+      }
+      syncPressed();
+
+      if (btn) {
+        btn.addEventListener('click', function () {
+          var nowDark = !root.classList.contains('dark');
+          root.classList.toggle('dark', nowDark);
+          try { localStorage.setItem('theme', nowDark ? 'dark' : 'light'); } catch (e) {}
+          syncPressed();
+        });
+      }
+
+      // If the user hasn't picked a theme, follow OS changes live.
+      try {
+        var mql = window.matchMedia('(prefers-color-scheme: dark)');
+        var listener = function (e) {
+          if (localStorage.getItem('theme') !== null) return;
+          root.classList.toggle('dark', e.matches);
+          syncPressed();
+        };
+        if (mql.addEventListener) mql.addEventListener('change', listener);
+        else if (mql.addListener) mql.addListener(listener);
+      } catch (e) {}
+    })();
+  </script>
 </body>
 </html>
