@@ -13,10 +13,25 @@
   {% when None %}
 {% endmatch %}
 
-<form hx-get="/search" hx-target="#results" hx-push-url="true">
+<form action="/search" method="get" role="search">
   <label>Search
-    <input type="search" name="q" value="{{ query }}" placeholder="composer, piece, opus..." autofocus>
+    <input
+      type="search"
+      name="q"
+      value="{{ query }}"
+      placeholder="composer, piece, opus, or 肖邦 / xiaobang"
+      autofocus
+      autocomplete="off"
+      aria-label="Sheet music search"
+      hx-get="/search"
+      hx-target="#results"
+      hx-trigger="keyup changed delay:300ms, search, input changed delay:300ms"
+      hx-indicator="#search-loading"
+      hx-sync="this:replace"
+      hx-push-url="true"
+    >
   </label>
+  <span id="search-loading" class="htmx-indicator" aria-live="polite">Searching&hellip;</span>
   <button type="submit">Search</button>
 </form>
 

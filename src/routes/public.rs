@@ -27,6 +27,14 @@ use super::AppState;
 
 const MAX_PDF_BYTES: usize = 10 * 1024 * 1024;
 const SEARCH_LIMIT_PER_SOURCE: usize = 10;
+/// Typeahead: ignore queries shorter than this. Avoids 1-char query storms
+/// while users are still typing the start of a name.
+const SEARCH_MIN_QUERY_LEN: usize = 2;
+/// Browser-side TTL for search responses. Re-typing the same query within
+/// this window hits the browser HTTP cache instead of round-tripping. Sized
+/// per the typeahead playbook (cache is stable enough for catalog content,
+/// new items still surface within a minute).
+const SEARCH_CACHE_TTL_SECS: u32 = 60;
 
 #[derive(Template)]
 #[template(path = "search.html")]
@@ -110,6 +118,12 @@ async fn search(
         .await;
         return render_results(is_htmx, &query, Vec::new(), site_key).into_response();
     }
+    if query.chars().count() < SEARCH_MIN_QUERY_LEN {
+        // Typeahead: too short to be useful and the upstream sources will
+        // mostly return noise. Return an empty result set silently — the
+        // user will keep typing.
+        return render_results(is_htmx, &query, Vec::new(), site_key).into_response();
+    }
 
     // Multilingual expansion: a single user query becomes up to 4 query
     // variants (English / Simplified / Traditional / Pinyin) when known
@@ -170,7 +184,16 @@ async fn search(
     )
     .await;
 
-    render_results(is_htmx, &query, results, site_key).into_response()
+    let mut response = render_results(is_htmx, &query, results, site_key).into_response();
+    // Browser HTTP cache: re-typing the same query within the TTL serves
+    // from cache, no upstream re-hit. Same per-query response for any
+    // anonymous visitor, so `public` is correct.
+    if let Ok(v) = HeaderValue::from_str(&format!(
+        "public, max-age={SEARCH_CACHE_TTL_SECS}"
+    )) {
+        response.headers_mut().insert(header::CACHE_CONTROL, v);
+    }
+    response
 }
 
 fn render_results(
