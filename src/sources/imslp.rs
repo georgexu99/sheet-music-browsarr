@@ -209,6 +209,10 @@ impl Source for Imslp {
             // endpoint; it scrapes the wiki page on first hit, caches the
             // resolved CDN URL for 24h, and redirects.
             let thumbnail_url = Some(format!("/thumbnail/imslp/{}", id));
+            // IMSLP's OpenSearch endpoint only returns title/desc/url — no
+            // structured metadata (pages/key/instrumentation). Enriching
+            // each result would require a per-result wiki-page scrape and
+            // blow the search latency budget; leave empty for now.
             results.push(SearchResult {
                 source: "imslp".to_string(),
                 id,
@@ -216,6 +220,7 @@ impl Source for Imslp {
                 description: desc,
                 external_url: url,
                 thumbnail_url,
+                metadata: Vec::new(),
             });
         }
         Ok(results)

@@ -8,7 +8,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::{SearchResult, Source};
+use super::{BadgeKind, MetadataBadge, SearchResult, Source};
 
 // MuseScore.com aggressively rejects obvious bot UAs (Cloudflare challenge
 // page on the score-page fetch). A modern desktop Chrome UA is required.
@@ -294,6 +294,33 @@ impl Source for Musescore {
         let mut results = Vec::with_capacity(scores.len().min(limit));
         for s in scores.into_iter().take(limit) {
             let title = strip_highlight_markers(&s.title);
+            let mut metadata: Vec<MetadataBadge> = Vec::new();
+            if let Some(p) = s.pages_count {
+                if p > 0 {
+                    metadata.push(MetadataBadge {
+                        label: if p == 1 {
+                            "1 page".to_string()
+                        } else {
+                            format!("{p} pages")
+                        },
+                        kind: BadgeKind::Pages,
+                    });
+                }
+            }
+            if let Some(parts) = s.parts_count {
+                if parts > 1 {
+                    metadata.push(MetadataBadge {
+                        label: format!("{parts} parts"),
+                        kind: BadgeKind::Generic,
+                    });
+                }
+            }
+            for inst in s.instrumentations {
+                metadata.push(MetadataBadge {
+                    label: inst,
+                    kind: BadgeKind::Instrument,
+                });
+            }
             results.push(SearchResult {
                 source: "musescore".to_string(),
                 id: s.id.to_string(),
@@ -303,6 +330,7 @@ impl Source for Musescore {
                     .href
                     .unwrap_or_else(|| format!("https://musescore.com/score/{}", s.id)),
                 thumbnail_url: s.thumbnail_url,
+                metadata,
             });
         }
         Ok(results)
@@ -392,6 +420,15 @@ struct SearchScore {
     composer_name: Option<String>,
     href: Option<String>,
     thumbnail_url: Option<String>,
+    /// Total rendered pages, when present in the hydration payload. Used
+    /// for a "N pages" badge.
+    pages_count: Option<usize>,
+    /// Number of parts/voices; only emitted as a badge when > 1.
+    parts_count: Option<usize>,
+    /// Free-text instrumentation labels (e.g. "Piano", "Voice"). MuseScore
+    /// usually returns 1–3 entries per score; we render each as its own
+    /// pill so they stay short.
+    instrumentations: Vec<String>,
 }
 
 /// Look for the JS bundle URL that matches the upstream extension's regex:
@@ -754,12 +791,27 @@ fn extract_search_scores(html: &str) -> Option<Vec<SearchScore>> {
             .or_else(|| s.get("thumbnail_url").and_then(|x| x.as_str()))
             .filter(|s| !s.is_empty())
             .map(String::from);
+        // MuseScore's hydration JSON exposes pages_count and (less reliably)
+        // parts_count and an instrumentations array. We pull whatever's
+        // present; missing keys just mean no badge for that score.
+        let pages_count = s
+            .get("pages_count")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize);
+        let parts_count = s
+            .get("parts_count")
+            .and_then(|x| x.as_u64())
+            .map(|n| n as usize);
+        let instrumentations = extract_instrumentations(s.get("instrumentations"));
         out.push(SearchScore {
             id,
             title,
             composer_name,
             href,
             thumbnail_url,
+            pages_count,
+            parts_count,
+            instrumentations,
         });
     }
     Some(out)
@@ -788,6 +840,40 @@ fn find_scores_array(v: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
         serde_json::Value::Array(arr) => arr.iter().find_map(find_scores_array),
         _ => None,
     }
+}
+
+/// MuseScore's `instrumentations` field has varied shape across deploys:
+/// sometimes a list of strings, sometimes a list of `{name: "Piano"}`
+/// objects, sometimes absent. Normalise to a Vec<String> of cleaned labels.
+/// We cap at 2 entries to keep the badge row visually quiet on dense
+/// orchestral works.
+fn extract_instrumentations(v: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(arr) = v.and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in arr {
+        let label = if let Some(s) = entry.as_str() {
+            Some(s.to_string())
+        } else if let Some(obj) = entry.as_object() {
+            obj.get("name")
+                .and_then(|x| x.as_str())
+                .map(String::from)
+                .or_else(|| obj.get("title").and_then(|x| x.as_str()).map(String::from))
+        } else {
+            None
+        };
+        if let Some(l) = label {
+            let l = l.trim();
+            if !l.is_empty() {
+                out.push(l.to_string());
+            }
+        }
+        if out.len() >= 2 {
+            break;
+        }
+    }
+    out
 }
 
 /// MuseScore wraps highlighted query matches in `[b]...[/b]` (BBCode-ish).

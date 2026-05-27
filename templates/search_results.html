@@ -31,6 +31,13 @@
               <h2 class="text-base font-medium leading-snug">{{ r.title }}</h2>
               <span class="source-badge source-badge-{{ r.source }} shrink-0">{{ r.source }}</span>
             </div>
+            {% if !r.metadata.is_empty() %}
+              <div class="flex flex-wrap gap-1.5 mb-2">
+                {% for m in r.metadata %}
+                  <span class="meta-badge">{{ m.label }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
             {% match r.description %}
               {% when Some with (desc) %}
                 <p class="text-sm text-gray-500 dark:text-gray-400 mb-2 leading-relaxed">{{ desc }}</p>

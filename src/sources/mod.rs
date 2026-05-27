@@ -26,6 +26,39 @@ pub struct SearchResult {
     /// that would need an extra HTTP roundtrip per result should leave it
     /// `None` to keep search latency bounded.
     pub thumbnail_url: Option<String>,
+    /// Small, source-extracted metadata pills (pages count, instrumentation,
+    /// key, etc.) rendered as gray context badges under the title. Sources
+    /// populate whatever they can pull cheaply from the search response;
+    /// missing values stay out of the Vec rather than rendering as "—".
+    /// Per-result HTTP enrichment is explicitly not done here — search
+    /// latency budget is tight.
+    #[serde(default)]
+    pub metadata: Vec<MetadataBadge>,
+}
+
+/// A small contextual metadata pill rendered below the title on a search
+/// result card. `kind` carries the visual style; `label` is the rendered
+/// text (already formatted, e.g. "12 pages", "C minor", "1823").
+#[derive(Debug, Clone, Serialize)]
+pub struct MetadataBadge {
+    pub label: String,
+    pub kind: BadgeKind,
+}
+
+/// Visual style for a `MetadataBadge`. Kept small on purpose — the badges
+/// are context, not focus, so they all share a neutral gray palette in the
+/// template today. The `kind` is preserved on the struct anyway so we can
+/// re-skin per kind later (e.g. tint Difficulty by level) without changing
+/// the source extractors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BadgeKind {
+    Pages,
+    Key,
+    Year,
+    Instrument,
+    Difficulty,
+    Generic,
 }
 
 /// A backend that knows how to search for sheet music and fetch PDFs for a
