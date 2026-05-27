@@ -116,37 +116,110 @@ impl Imslp {
             .await
             .context("imslp page body")?;
 
-        let doc = Html::parse_document(&html);
-        let sel = Selector::parse("a").map_err(|e| anyhow::anyhow!("selector: {e}"))?;
+        // Scope the scraper types (Html / Selector use Rc internally and are
+        // !Send) so they're dropped before any .await further down. Without
+        // this scope, the surrounding future is !Send and axum rejects it.
+        let candidate = {
+            let doc = Html::parse_document(&html);
+            let sel = Selector::parse("a").map_err(|e| anyhow::anyhow!("selector: {e}"))?;
 
-        let mut direct_cdn: Option<String> = None;
-        let mut disclaimer_gated: Option<String> = None;
-        let mut other_pdf: Option<String> = None;
+            let mut direct_cdn: Option<String> = None;
+            let mut disclaimer_gated: Option<String> = None;
+            let mut other_pdf: Option<String> = None;
 
-        for el in doc.select(&sel) {
-            let Some(href) = el.value().attr("href") else {
-                continue;
-            };
-            let lower = href.to_lowercase();
+            for el in doc.select(&sel) {
+                let Some(href) = el.value().attr("href") else {
+                    continue;
+                };
+                let lower = href.to_lowercase();
 
-            if direct_cdn.is_none() && lower.contains("/imglnks/") && lower.contains(".pdf") {
-                direct_cdn = Some(absolutize(href));
-            } else if disclaimer_gated.is_none() && href.contains("Special:ImagefromIndex") {
-                disclaimer_gated = Some(absolutize(href));
-            } else if other_pdf.is_none() && lower.ends_with(".pdf") {
-                other_pdf = Some(absolutize(href));
+                if direct_cdn.is_none() && lower.contains("/imglnks/") && lower.contains(".pdf") {
+                    direct_cdn = Some(absolutize(href));
+                } else if disclaimer_gated.is_none() && href.contains("Special:ImagefromIndex") {
+                    disclaimer_gated = Some(absolutize(href));
+                } else if other_pdf.is_none() && lower.ends_with(".pdf") {
+                    other_pdf = Some(absolutize(href));
+                }
             }
+
+            direct_cdn
+                .or(disclaimer_gated)
+                .or(other_pdf)
+                .ok_or_else(|| anyhow::anyhow!("no PDF link on {page_url}"))?
+        };
+
+        // If the candidate is a direct CDN URL, we're done.
+        if candidate.to_lowercase().contains("/imglnks/") {
+            return Ok(candidate);
         }
 
-        direct_cdn
-            .or(disclaimer_gated)
-            .or(other_pdf)
-            .ok_or_else(|| anyhow::anyhow!("no PDF link on {page_url}"))
+        // Otherwise the candidate is the disclaimer interstitial
+        // (Special:ImagefromIndex/...). Follow it and try to extract the
+        // real CDN URL embedded in the page (meta-refresh, JS redirect,
+        // or "click here to continue" link).
+        match self.http.get(&candidate).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let ct = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ct.starts_with("application/pdf") {
+                    // Disclaimer URL actually served the PDF directly.
+                    return Ok(candidate);
+                }
+                if let Ok(body) = resp.text().await {
+                    if let Some(actual) = scrape_cdn_pdf_url(&body) {
+                        return Ok(actual);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // Fall back to the candidate. Caller will see non-PDF Content-Type
+        // and redirect to the wiki page.
+        Ok(candidate)
     }
 
     pub fn http(&self) -> &Client {
         &self.http
     }
+}
+
+/// Pull an `imslp.org/imglnks/.../*.pdf` URL out of an arbitrary HTML
+/// or JS body. Used to follow IMSLP's disclaimer interstitial: the page
+/// itself contains the eventual file URL in a meta-refresh, a JS
+/// `window.location` assignment, or a fallback `<a>` tag.
+fn scrape_cdn_pdf_url(html: &str) -> Option<String> {
+    // Two variants: plain `/imglnks/` and JS-escaped `\/imglnks\/`.
+    for needle in ["imslp.org/imglnks/", "imslp.org\\/imglnks\\/"] {
+        let mut search_start = 0;
+        while let Some(rel) = html[search_start..].find(needle) {
+            let abs = search_start + rel;
+            let prefix = &html[..abs];
+            let scheme_start = match prefix.rfind("https://").or_else(|| prefix.rfind("http://")) {
+                Some(s) => s,
+                None => {
+                    search_start = abs + needle.len();
+                    continue;
+                }
+            };
+            let tail = &html[scheme_start..];
+            let term_idx = tail
+                .find(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r'))
+                .unwrap_or(tail.len());
+            let raw = &tail[..term_idx];
+            // Unescape JS-style `\/` to `/`.
+            let url = raw.replace("\\/", "/");
+            if url.to_lowercase().contains(".pdf") {
+                return Some(url);
+            }
+            search_start = abs + needle.len();
+        }
+    }
+    None
 }
 
 fn page_id_from_url(url: &str) -> Option<String> {
