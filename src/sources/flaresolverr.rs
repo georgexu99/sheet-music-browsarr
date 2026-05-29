@@ -27,28 +27,17 @@ use anyhow::Context;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-/// Wall-clock cap on the FlareSolverr HTTP call itself — the hard ceiling
-/// for *any* FS request. Observed FS solve times under modest load: 5–30 s
-/// with sessions, 30–60 s without. 45 s threads the needle for the
-/// download-resolution path (score page): enough headroom for a slow solve
-/// to land, but short enough that a truly wedged FS surfaces as a failure
-/// within a minute. The search path sets a much tighter *FS-side* budget
-/// (`FS_SEARCH_MAX_TIMEOUT_MS`) so it bails long before this ceiling.
+/// Wall-clock cap on the FlareSolverr HTTP call itself. Observed FS
+/// solve times under modest load: 5–30 s with sessions, 30–60 s
+/// without. 45 s threads the needle: enough headroom for a slow
+/// solve to land, but short enough that a truly wedged FS surfaces
+/// as a failure within a minute rather than dragging out a search.
 const FS_TIMEOUT: Duration = Duration::from_secs(45);
 
-/// `maxTimeout` for the interactive search path — the budget FlareSolverr
-/// itself applies to solving the challenge. Deliberately far tighter than
-/// the HTTP ceiling: even though MuseScore now streams in out-of-band (so a
-/// slow solve no longer blocks the fast sources), the deferred request still
-/// makes the user wait, so we cap the cold-solve tail rather than letting it
-/// run the full 45 s. 12 s covers a warm-session solve.
-pub const FS_SEARCH_MAX_TIMEOUT_MS: u64 = 12_000;
-
-/// `maxTimeout` for the score-page / download-resolution path, where
-/// landing the result matters more than latency. Matches the HTTP ceiling
-/// so the failure mode is a single clean error rather than a layered
-/// double-timeout.
-pub const FS_PAGE_MAX_TIMEOUT_MS: u64 = 45_000;
+/// `maxTimeout` field passed to FlareSolverr — the budget *it* applies to
+/// solving the challenge. Match the HTTP-side timeout so the failure
+/// mode is a single clean error rather than a layered double-timeout.
+const FS_MAX_TIMEOUT_MS: u64 = 45_000;
 
 #[derive(Clone)]
 pub struct FlareSolverr {
@@ -176,21 +165,12 @@ impl FlareSolverr {
     /// FS reuses the persistent browser context created earlier via
     /// `create_session` — drastically faster than the default
     /// ephemeral mode for repeated calls.
-    ///
-    /// `max_timeout_ms` is the FS-side solve budget; callers pass the
-    /// tight `FS_SEARCH_MAX_TIMEOUT_MS` on the search path and the looser
-    /// `FS_PAGE_MAX_TIMEOUT_MS` on the download-resolution path.
-    pub async fn get(
-        &self,
-        url: &str,
-        session: Option<&str>,
-        max_timeout_ms: u64,
-    ) -> anyhow::Result<FsSolution> {
+    pub async fn get(&self, url: &str, session: Option<&str>) -> anyhow::Result<FsSolution> {
         let endpoint = format!("{}/v1", self.base_url);
         let body = FsRequest {
             cmd: "request.get",
             url,
-            max_timeout: max_timeout_ms,
+            max_timeout: FS_MAX_TIMEOUT_MS,
             session,
         };
         let env: FsEnvelope = self

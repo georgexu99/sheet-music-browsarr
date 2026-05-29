@@ -12,9 +12,7 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::flaresolverr::{
-    FlareSolverr, FsSolution, FS_PAGE_MAX_TIMEOUT_MS, FS_SEARCH_MAX_TIMEOUT_MS,
-};
+use super::flaresolverr::{FlareSolverr, FsSolution};
 use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
 
 /// Env var name. When set, MuseScore's Cloudflare-challenged GETs go
@@ -215,19 +213,11 @@ impl Musescore {
     /// direct fetches (bundle JS, /api/jmuse, CDN PNGs) carry the
     /// `cf_clearance` if MuseScore expands CF coverage to those paths.
     async fn fetch_html_challenged(&self, url: &str, ctx_label: &'static str) -> anyhow::Result<String> {
-        // The search path is latency-sensitive, so give FlareSolverr a tight
-        // solve budget there; the score-page path (PDF resolution) prioritises
-        // landing the result, so it gets the looser budget.
-        let fs_max_timeout = if ctx_label == "search" {
-            FS_SEARCH_MAX_TIMEOUT_MS
-        } else {
-            FS_PAGE_MAX_TIMEOUT_MS
-        };
         match &self.fs {
             Some(fs) => {
                 let session = self.ensure_fs_session().await;
                 let solution: FsSolution = fs
-                    .get(url, session.as_deref(), fs_max_timeout)
+                    .get(url, session.as_deref())
                     .await
                     .with_context(|| format!("flaresolverr {ctx_label} {url}"))?;
                 if solution.status >= 400 {
