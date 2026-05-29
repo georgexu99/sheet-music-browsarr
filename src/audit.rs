@@ -40,6 +40,35 @@ pub async fn record(
     }
 }
 
+/// Fire-and-forget variant of [`record`]: spawns the insert onto the tokio
+/// runtime so the audit write never sits on a request's response path.
+/// SQLite serializes writes, so awaiting the insert inline adds lock
+/// contention to every logged action (notably the hot search path). Takes
+/// owned arguments because the spawned future must be `'static`; failures are
+/// logged inside [`record`] and otherwise dropped.
+pub fn record_spawn(
+    pool: SqlitePool,
+    ip: String,
+    user_agent: Option<String>,
+    action: &'static str,
+    target: Option<String>,
+    result: &'static str,
+    meta: Option<String>,
+) {
+    tokio::spawn(async move {
+        record(
+            &pool,
+            &ip,
+            user_agent.as_deref(),
+            action,
+            target.as_deref(),
+            result,
+            meta.as_deref(),
+        )
+        .await;
+    });
+}
+
 /// Pull the originating client IP from request headers, preferring
 /// `cf-connecting-ip` (set by Cloudflare tunnel), then `x-forwarded-for`,
 /// falling back to a literal `"unknown"`.

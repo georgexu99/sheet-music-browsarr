@@ -127,6 +127,20 @@ pub fn new_thumbnail_bytes_cache() -> ThumbnailBytesCache {
         .build()
 }
 
+/// Outcome of an [`L2Cache::get`] lookup, carrying the freshness signal the
+/// stale-while-revalidate path in [`cached_search`] needs.
+#[derive(Debug)]
+enum L2Lookup {
+    /// Row present and within its TTL — serve directly.
+    Fresh(Vec<SearchResult>),
+    /// Row present and past its TTL, but still inside the stale grace window
+    /// (one further TTL). Serve it immediately and refresh in the background
+    /// so nobody waits on a cold upstream fetch at the expiry edge.
+    Stale(Vec<SearchResult>),
+    /// No usable row: absent, beyond the grace window, or undecodable.
+    Miss,
+}
+
 /// Durable (L2) search-result cache backed by the SQLite `search_cache`
 /// table (see `migrations/0004_search_cache.sql`).
 ///
@@ -157,18 +171,14 @@ impl L2Cache {
         Self { pool }
     }
 
-    /// Look up a non-expired entry. Returns `None` on miss, on an expired
-    /// row, or on any DB/deserialization error (all best-effort). Expired
-    /// rows are swept lazily on the read path — there's no background job.
-    async fn get(&self, key: &CacheKey) -> Option<Vec<SearchResult>> {
+    /// Look up an entry with stale-while-revalidate semantics:
+    /// [`L2Lookup::Fresh`] within the TTL, [`L2Lookup::Stale`] for a row that
+    /// expired but is still inside a grace window of one further TTL, and
+    /// [`L2Lookup::Miss`] otherwise. Rows past the grace window — and any row
+    /// we can't parse/decode — are swept lazily on this read path (no
+    /// background job). Every error degrades to `Miss` (best-effort).
+    async fn get(&self, key: &CacheKey) -> L2Lookup {
         let k = key.l2_key();
-        let now = match OffsetDateTime::now_utc().format(&Rfc3339) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(error = %e, "l2 cache: ts format");
-                return None;
-            }
-        };
         let row: Result<Option<(String, String)>, _> = sqlx::query_as(
             "SELECT payload, expires_at FROM search_cache WHERE cache_key = ?",
         )
@@ -178,36 +188,56 @@ impl L2Cache {
 
         let (payload, expires_at) = match row {
             Ok(Some(r)) => r,
-            Ok(None) => return None,
+            Ok(None) => return L2Lookup::Miss,
             Err(e) => {
                 tracing::warn!(error = %e, "l2 cache: lookup failed");
-                return None;
+                return L2Lookup::Miss;
             }
         };
 
-        // Treat a past-due row as absent and sweep it. String comparison is
-        // valid here because RFC3339 UTC timestamps sort lexicographically.
-        if expires_at <= now {
-            let _ = sqlx::query("DELETE FROM search_cache WHERE cache_key = ?")
-                .bind(&k)
-                .execute(&self.pool)
-                .await;
-            return None;
+        let expires = match OffsetDateTime::parse(&expires_at, &Rfc3339) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "l2 cache: expires_at parse; dropping row");
+                self.sweep(&k).await;
+                return L2Lookup::Miss;
+            }
+        };
+
+        // Past the fresh window *and* the stale grace window → too old to
+        // serve even stale; sweep and miss. Grace mirrors the per-source TTL,
+        // so MuseScore stays servable-while-stale for a second week and the
+        // cheap sources for a second 60 s.
+        let now = OffsetDateTime::now_utc();
+        if now > expires + key.ttl() {
+            self.sweep(&k).await;
+            return L2Lookup::Miss;
         }
 
-        match serde_json::from_str::<Vec<SearchResult>>(&payload) {
-            Ok(v) => Some(v),
+        let results = match serde_json::from_str::<Vec<SearchResult>>(&payload) {
+            Ok(v) => v,
             Err(e) => {
                 // A schema drift / corrupt row shouldn't poison the cache
                 // forever: drop it so the next miss repopulates cleanly.
                 tracing::warn!(error = %e, "l2 cache: payload decode failed; dropping row");
-                let _ = sqlx::query("DELETE FROM search_cache WHERE cache_key = ?")
-                    .bind(&k)
-                    .execute(&self.pool)
-                    .await;
-                None
+                self.sweep(&k).await;
+                return L2Lookup::Miss;
             }
+        };
+
+        if now < expires {
+            L2Lookup::Fresh(results)
+        } else {
+            L2Lookup::Stale(results)
         }
+    }
+
+    /// Best-effort delete of a single cache row by its textual key.
+    async fn sweep(&self, k: &str) {
+        let _ = sqlx::query("DELETE FROM search_cache WHERE cache_key = ?")
+            .bind(k)
+            .execute(&self.pool)
+            .await;
     }
 
     /// Upsert an entry with a per-source TTL (mirrors the moka L1 policy).
@@ -253,16 +283,22 @@ impl L2Cache {
     }
 }
 
-/// Two-tier read-through wrapper around `Source::search`.
+/// Two-tier, single-flight, stale-while-revalidate wrapper around
+/// `Source::search`.
 ///
 /// Lookup order on a request:
 ///   1. moka L1 (in-process, fast, lost on restart) — hit returns immediately.
-///   2. durable L2 (`l2`, SQLite-backed) when configured — hit re-warms L1
-///      and returns.
-///   3. the real `Source::search` — result populates *both* L1 and L2.
+///   2. durable L2 (`l2`, SQLite-backed) when configured:
+///        * fresh hit → re-warm L1 and return.
+///        * stale-but-within-grace hit → return the stale results *now* and
+///          kick a background refresh, so nobody waits on the expiry edge (a
+///          5–45 s MuseScore solve in the worst case).
+///   3. cold miss → fetch from the real source, single-flighted through moka
+///      (`try_get_with`) so N concurrent identical misses collapse into one
+///      upstream call, then populate L1 + L2.
 ///
-/// `l2 == None` reproduces the original moka-only cache-aside behavior
-/// exactly, so leaving `BROWSARR_PERSISTENT_SEARCH_CACHE` unset is a no-op.
+/// `l2 == None` reproduces the original moka-only cache-aside behavior, so
+/// leaving `BROWSARR_PERSISTENT_SEARCH_CACHE` unset is a no-op.
 pub async fn cached_search(
     cache: &SearchCache,
     l2: Option<&L2Cache>,
@@ -278,27 +314,105 @@ pub async fn cached_search(
         instrument: filters.instrument,
     };
 
-    // L1: in-process moka.
+    // L1: in-process moka. Always fresh (moka enforces the TTL).
     if let Some(cached) = cache.get(&key).await {
         return Ok((*cached).clone());
     }
 
-    // L2: durable SQLite store (best-effort). A hit re-warms L1 so repeat
-    // queries within the moka TTL skip the DB round-trip.
+    // L2: durable SQLite store (best-effort), with stale-while-revalidate.
     if let Some(l2) = l2 {
-        if let Some(results) = l2.get(&key).await {
-            cache.insert(key.clone(), Arc::new(results.clone())).await;
-            return Ok(results);
+        match l2.get(&key).await {
+            L2Lookup::Fresh(results) => {
+                cache.insert(key.clone(), Arc::new(results.clone())).await;
+                return Ok(results);
+            }
+            L2Lookup::Stale(results) => {
+                // Serve stale immediately; refresh in the background. The
+                // refresh is single-flighted on the same moka key, so even if
+                // many requests serve stale at once only one upstream fetch
+                // runs.
+                spawn_refresh(
+                    cache.clone(),
+                    l2.clone(),
+                    source.clone(),
+                    query.to_string(),
+                    filters.clone(),
+                    limit,
+                );
+                return Ok(results);
+            }
+            L2Lookup::Miss => {}
         }
     }
 
-    // Miss in both tiers: hit the real source and populate L1 + L2.
-    let results = source.search(query, filters, limit).await?;
-    cache.insert(key.clone(), Arc::new(results.clone())).await;
-    if let Some(l2) = l2 {
-        l2.insert(&key, &results).await;
+    // Cold miss in both tiers: single-flighted upstream fetch.
+    fetch_single_flight(cache, l2, source, query, filters, limit, key).await
+}
+
+/// Fetch from the real source under moka's single-flight (`try_get_with`):
+/// concurrent callers with the same key share one upstream call and one L2
+/// write. Populates L1 (via `try_get_with`) and L2.
+async fn fetch_single_flight(
+    cache: &SearchCache,
+    l2: Option<&L2Cache>,
+    source: &Arc<dyn Source>,
+    query: &str,
+    filters: &SearchFilters,
+    limit: usize,
+    key: CacheKey,
+) -> anyhow::Result<Vec<SearchResult>> {
+    // moka runs `init` on the "leader" caller for this key; concurrent
+    // followers await its result instead of launching their own fetch. Own
+    // everything the future captures so it stays self-contained ('static).
+    let l2 = l2.cloned();
+    let source = source.clone();
+    let query = query.to_string();
+    let filters = filters.clone();
+    let init_key = key.clone();
+    let init = async move {
+        let results = source.search(&query, &filters, limit).await?;
+        let arc = Arc::new(results);
+        if let Some(l2) = &l2 {
+            l2.insert(&init_key, arc.as_ref()).await;
+        }
+        Ok::<_, anyhow::Error>(arc)
+    };
+    match cache.try_get_with(key, init).await {
+        Ok(arc) => Ok((*arc).clone()),
+        // try_get_with hands back the leader's error as `Arc<anyhow::Error>`;
+        // flatten it into a fresh chain for the caller.
+        Err(e) => Err(anyhow::anyhow!("{:#}", e)),
     }
-    Ok(results)
+}
+
+/// Spawn a detached, single-flighted refresh of a key whose L2 entry was just
+/// served stale. Errors are swallowed (the caller already returned stale
+/// results); success repopulates L1 + L2 with fresh data.
+fn spawn_refresh(
+    cache: SearchCache,
+    l2: L2Cache,
+    source: Arc<dyn Source>,
+    query: String,
+    filters: SearchFilters,
+    limit: usize,
+) {
+    tokio::spawn(async move {
+        let key = CacheKey {
+            source: source.id(),
+            query: query.clone(),
+            limit,
+            instrument: filters.instrument,
+        };
+        if let Err(e) =
+            fetch_single_flight(&cache, Some(&l2), &source, &query, &filters, limit, key).await
+        {
+            tracing::warn!(
+                source = source.id(),
+                error = %format!("{e:#}"),
+                "l2 cache: background refresh failed"
+            );
+        }
+    });
 }
 
 #[cfg(test)]
@@ -375,12 +489,18 @@ mod tests {
     async fn l2_round_trips_a_search_result() {
         let l2 = L2Cache::new(test_pool().await);
         let k = key("musescore", "chopin nocturne", 20);
-        assert!(l2.get(&k).await.is_none(), "cold lookup is a miss");
+        assert!(
+            matches!(l2.get(&k).await, L2Lookup::Miss),
+            "cold lookup is a miss"
+        );
 
         let results = vec![sample_result("Nocturne Op.9 No.2")];
         l2.insert(&k, &results).await;
 
-        let got = l2.get(&k).await.expect("hit after insert");
+        let got = match l2.get(&k).await {
+            L2Lookup::Fresh(v) => v,
+            other => panic!("expected Fresh after insert, got {other:?}"),
+        };
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].title, "Nocturne Op.9 No.2");
         assert_eq!(got[0].complexity, Some(2));
@@ -410,13 +530,56 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(l2.get(&k).await.is_none(), "expired row reads as a miss");
+        assert!(
+            matches!(l2.get(&k).await, L2Lookup::Miss),
+            "row past the grace window reads as a miss"
+        );
 
         let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM search_cache")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(remaining.0, 0, "expired row was swept on read");
+        assert_eq!(remaining.0, 0, "row past the grace window was swept on read");
+    }
+
+    #[tokio::test]
+    async fn l2_serves_recently_expired_rows_as_stale() {
+        let pool = test_pool().await;
+        let l2 = L2Cache::new(pool.clone());
+        // imslp TTL is 60s with a 60s stale grace, so a row that expired 10s
+        // ago is still inside the grace window → Stale (served while a
+        // background refresh runs), and must NOT be swept.
+        let k = key("imslp", "barely stale", 20);
+        let expired_10s_ago = (OffsetDateTime::now_utc() - Duration::from_secs(10))
+            .format(&Rfc3339)
+            .unwrap();
+        let created = (OffsetDateTime::now_utc() - Duration::from_secs(70))
+            .format(&Rfc3339)
+            .unwrap();
+        let payload = serde_json::to_string(&vec![sample_result("stale hit")]).unwrap();
+        sqlx::query(
+            "INSERT INTO search_cache (cache_key, source, payload, created_at, expires_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(k.l2_key())
+        .bind(k.source)
+        .bind(&payload)
+        .bind(&created)
+        .bind(&expired_10s_ago)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        match l2.get(&k).await {
+            L2Lookup::Stale(v) => assert_eq!(v[0].title, "stale hit"),
+            other => panic!("expected Stale within grace window, got {other:?}"),
+        }
+
+        let remaining: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM search_cache")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining.0, 1, "stale row retained for serve-while-revalidate");
     }
 
     #[tokio::test]
@@ -427,7 +590,10 @@ mod tests {
         l2.insert(&k, &[sample_result("first")]).await;
         l2.insert(&k, &[sample_result("second")]).await;
 
-        let got = l2.get(&k).await.expect("hit");
+        let got = match l2.get(&k).await {
+            L2Lookup::Fresh(v) => v,
+            other => panic!("expected Fresh, got {other:?}"),
+        };
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].title, "second", "second insert overwrote the first");
     }

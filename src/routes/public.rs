@@ -480,16 +480,15 @@ async fn search(
         is_htmx && first_param(&params, "defer") == Some("musescore");
 
     if query.is_empty() {
-        audit::record(
-            &state.pool,
-            &ip,
-            ua.as_deref(),
+        audit::record_spawn(
+            state.pool.clone(),
+            ip.clone(),
+            ua.clone(),
             "search",
             None,
             "empty_query",
             None,
-        )
-        .await;
+        );
         if is_defer {
             return MusescorePartial { results: Vec::new() }.into_response();
         }
@@ -604,6 +603,28 @@ async fn search(
     // its own slot — page 1's 10-per-source vec doesn't shadow page 2's
     // 20-per-source vec.
     let per_source_limit = SEARCH_LIMIT_PER_SOURCE * (page as usize);
+
+    // Prewarm: kick the slow MuseScore search in the background *now*, so by
+    // the time the browser fires the deferred `?defer=musescore` request it
+    // lands on a warm cache instead of a cold FlareSolverr solve. Gated to the
+    // same condition that emits the deferred loader (first page of a real
+    // query with MuseScore selected) and skipped in defer mode (that request
+    // *is* the MuseScore fetch). The single-flight in `cached_search`
+    // collapses this and the deferred request into one upstream call, and the
+    // query/limit/instrument match the deferred request's cache key exactly.
+    if !is_defer && !is_append && page == 1 && musescore_selected {
+        if let Some(ms) = state.find_source("musescore") {
+            let cache = search_cache.clone();
+            let l2 = search_cache_l2.clone();
+            let q = query.clone();
+            let f = filters.clone();
+            tokio::spawn(async move {
+                let _ =
+                    cache::cached_search(&cache, l2.as_ref(), &ms, &q, &f, per_source_limit).await;
+            });
+        }
+    }
+
     let futures = pairs.into_iter().map(|(src, v)| {
         let cache = search_cache.clone();
         let l2 = search_cache_l2.clone();
@@ -690,22 +711,21 @@ async fn search(
         None
     };
 
-    audit::record(
-        &state.pool,
-        &ip,
-        ua.as_deref(),
+    audit::record_spawn(
+        state.pool.clone(),
+        ip.clone(),
+        ua.clone(),
         "search",
-        Some(&query),
+        Some(query.clone()),
         "ok",
-        Some(&format!(
+        Some(format!(
             r#"{{"results":{},"variants":{},"page":{},"deduped":{}}}"#,
             results.len(),
             variants.len(),
             page,
             deduped_total,
         )),
-    )
-    .await;
+    );
 
     // No Cache-Control header on /search responses. The same URL serves
     // two different shapes (HTMX partial vs full page on native nav) and
