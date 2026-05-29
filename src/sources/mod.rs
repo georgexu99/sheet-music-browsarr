@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 pub mod flaresolverr;
 pub mod health;
@@ -180,7 +180,7 @@ pub struct SearchFilters {
     pub score_type: Option<ScoreType>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     /// Stable identifier of the source this result came from (e.g., "imslp",
     /// "mutopia"). Matches the value returned by `Source::id`.
@@ -231,7 +231,7 @@ pub struct SearchResult {
 /// A small contextual metadata pill rendered below the title on a search
 /// result card. `kind` carries the visual style; `label` is the rendered
 /// text (already formatted, e.g. "12 pages", "C minor", "1823").
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetadataBadge {
     pub label: String,
     pub kind: BadgeKind,
@@ -242,7 +242,7 @@ pub struct MetadataBadge {
 /// template today. The `kind` is preserved on the struct anyway so we can
 /// re-skin per kind later (e.g. tint Difficulty by level) without changing
 /// the source extractors.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[allow(dead_code)] // Key/Difficulty kept for sources that can extract them later.
 pub enum BadgeKind {

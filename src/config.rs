@@ -5,6 +5,15 @@ pub struct Config {
     pub secret_key: String,
     pub admin_password_init: Option<String>,
     pub secure_cookies: bool,
+    /// Opt-in durable (L2) search-result cache, persisted in the SQLite
+    /// `search_cache` table. When true, cold MuseScore FlareSolverr solves
+    /// survive container restarts (and can be shared across instances that
+    /// mount the same DB) instead of being re-paid on every redeploy.
+    ///
+    /// Opt-in via `BROWSARR_PERSISTENT_SEARCH_CACHE=1` (matching the
+    /// `FLARESOLVERR_URL` opt-in pattern). When unset/false the app uses the
+    /// in-memory moka L1 cache only — identical to the pre-L2 behavior.
+    pub persistent_search_cache: bool,
 }
 
 impl Config {
@@ -32,6 +41,11 @@ impl Config {
             .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+        let persistent_search_cache = std::env::var("BROWSARR_PERSISTENT_SEARCH_CACHE")
+            .ok()
+            .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         Ok(Self {
             port,
             db_path,
@@ -39,6 +53,7 @@ impl Config {
             secret_key,
             admin_password_init,
             secure_cookies,
+            persistent_search_cache,
         })
     }
 }

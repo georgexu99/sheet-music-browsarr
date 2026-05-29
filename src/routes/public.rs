@@ -597,6 +597,7 @@ async fn search(
         })
         .collect();
     let search_cache: SearchCache = state.search_cache.clone();
+    let search_cache_l2 = state.search_cache_l2.clone();
     let health_map = state.source_health.clone();
     // Bump the per-source limit linearly with page number. The cache key in
     // src/cache.rs now includes `limit`, so each page's fetch caches under
@@ -605,10 +606,11 @@ async fn search(
     let per_source_limit = SEARCH_LIMIT_PER_SOURCE * (page as usize);
     let futures = pairs.into_iter().map(|(src, v)| {
         let cache = search_cache.clone();
+        let l2 = search_cache_l2.clone();
         let health = health_map.clone();
         let f = filters.clone();
         async move {
-            match cache::cached_search(&cache, &src, &v, &f, per_source_limit).await {
+            match cache::cached_search(&cache, l2.as_ref(), &src, &v, &f, per_source_limit).await {
                 Ok(rs) => {
                     // Cache hits also count as "ok" — if the cache has a
                     // valid entry, the source was reachable within the last

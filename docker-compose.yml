@@ -19,6 +19,12 @@ services:
       BROWSARR_DB_PATH: /config/sheet-music-browsarr.db
       BROWSARR_LIBRARY_PATH: /library
       BROWSARR_SECURE_COOKIES: "1"
+      # Durable (L2) search-result cache. Opt-in: set to "1" to persist
+      # search results (notably the expensive MuseScore FlareSolverr solves)
+      # in the SQLite DB so they survive container restarts/redeploys instead
+      # of being re-paid. Backed by the existing /config DB volume below — no
+      # extra service or volume needed. Leave unset for moka in-memory only.
+      BROWSARR_PERSISTENT_SEARCH_CACHE: "1"
       BROWSARR_SECRET_KEY: "${BROWSARR_SECRET_KEY}"
       BROWSARR_ADMIN_PASSWORD: "${BROWSARR_ADMIN_PASSWORD}"
       RUST_LOG: sheet_music_browsarr=info,tower_http=info

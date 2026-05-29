@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use sqlx::SqlitePool;
 
-use crate::cache::{SearchCache, ThumbnailBytesCache, ThumbnailCache};
+use crate::cache::{L2Cache, SearchCache, ThumbnailBytesCache, ThumbnailCache};
 use crate::secrets::Secrets;
 use crate::sources::health::HealthMap;
 use crate::sources::Source;
@@ -22,6 +22,11 @@ pub struct AppState {
     #[allow(dead_code)]
     pub secrets: Secrets,
     pub search_cache: SearchCache,
+    /// Durable (L2) search-result cache, behind `search_cache` (moka L1).
+    /// `None` unless `BROWSARR_PERSISTENT_SEARCH_CACHE` is enabled — when
+    /// absent the app runs moka-only. Lets cold MuseScore FlareSolverr
+    /// solves survive container restarts. See `src/cache.rs::L2Cache`.
+    pub search_cache_l2: Option<L2Cache>,
     /// Resolved-thumbnail URL cache for sources that need a lazy lookup
     /// (currently just IMSLP). 24h TTL; see `src/cache.rs`.
     pub thumbnail_cache: ThumbnailCache,

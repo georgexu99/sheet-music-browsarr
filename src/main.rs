@@ -47,6 +47,16 @@ async fn main() -> anyhow::Result<()> {
     let source_health = sources::health::new(&source_ids);
     let secrets = secrets::Secrets::new(&cfg.secret_key)?;
     let search_cache = cache::new_search_cache();
+    // Durable L2 search cache is opt-in (matches the FLARESOLVERR_URL
+    // pattern). When disabled the app uses moka L1 only — identical to the
+    // pre-L2 behavior. When enabled it reuses the existing SQLite pool /
+    // persistent volume, so cold MuseScore solves survive restarts.
+    let search_cache_l2 = if cfg.persistent_search_cache {
+        tracing::info!("persistent (L2) search cache enabled (SQLite-backed)");
+        Some(cache::L2Cache::new(pool.clone()))
+    } else {
+        None
+    };
     let thumbnail_cache = cache::new_thumbnail_cache();
     let thumbnail_bytes_cache = cache::new_thumbnail_bytes_cache();
     let state = routes::AppState {
@@ -54,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
         sources,
         secrets,
         search_cache,
+        search_cache_l2,
         thumbnail_cache,
         thumbnail_bytes_cache,
         library_path: cfg.library_path.clone(),
