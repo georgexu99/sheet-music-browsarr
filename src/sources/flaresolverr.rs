@@ -69,10 +69,10 @@ pub struct FsSolution {
     pub response: String,
     /// The UA FlareSolverr's bundled Chromium used. Callers replaying
     /// `cf_clearance` on direct fetches MUST set this same UA, since
-    /// Cloudflare binds the cookie to (IP, UA). Not yet honoured by
-    /// the MuseScore source — kept here for the future fix.
+    /// Cloudflare binds the cookie to (IP, UA). The MuseScore source
+    /// stashes this (`fs_ua`) and sends it on its direct-clearance fast
+    /// path so the replayed cookie validates.
     #[serde(rename = "userAgent")]
-    #[allow(dead_code)]
     pub user_agent: String,
     /// All cookies the upstream set during the resolved navigation,
     /// including `cf_clearance` and `__cf_bm`.

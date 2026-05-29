@@ -109,6 +109,16 @@ pub struct Musescore {
     /// time out. `None` until the first successful session create;
     /// stays `None` if create ever fails so we degrade to sessionless.
     fs_session: Mutex<Option<String>>,
+    /// The User-Agent FlareSolverr's bundled Chromium reported on the most
+    /// recent successful solve. `cf_clearance` is bound to the (IP, UA)
+    /// tuple, so a direct cookie-replay fetch MUST send this exact UA or
+    /// Cloudflare re-challenges. `None` until the first FS solve lands;
+    /// once set, `fetch_html_challenged` tries a plain reqwest GET first
+    /// (replaying the harvested `cf_clearance` under this UA) and only
+    /// falls back to FlareSolverr when that cookie has expired — turning
+    /// the steady-state search/score-page fetch from a multi-second
+    /// headless-Chromium round-trip into a sub-second HTTP call.
+    fs_ua: Mutex<Option<String>>,
     cached: Mutex<Option<CachedAlgorithm>>,
 }
 
@@ -169,6 +179,7 @@ impl Musescore {
             jar,
             fs,
             fs_session: Mutex::new(None),
+            fs_ua: Mutex::new(None),
             cached: Mutex::new(None),
         })
     }
@@ -215,6 +226,18 @@ impl Musescore {
     async fn fetch_html_challenged(&self, url: &str, ctx_label: &'static str) -> anyhow::Result<String> {
         match &self.fs {
             Some(fs) => {
+                // Fast path: once a prior solve has minted a `cf_clearance`
+                // cookie (now sitting in our jar) and told us the UA it was
+                // bound to, replay both on a plain reqwest GET. That skips
+                // FlareSolverr's headless-Chromium round-trip entirely —
+                // sub-second instead of seconds. Gated on having learned the
+                // UA (our proxy for "we've solved at least once"); a
+                // stale/expired cookie just 403s or returns the challenge
+                // page, and we fall through to the FlareSolverr path below.
+                if let Some(html) = self.try_direct_clearance(url, ctx_label).await {
+                    return Ok(html);
+                }
+
                 let session = self.ensure_fs_session().await;
                 let solution: FsSolution = fs
                     .get(url, session.as_deref())
@@ -228,6 +251,7 @@ impl Musescore {
                     );
                 }
                 self.absorb_fs_cookies(&solution);
+                self.remember_fs_ua(&solution.user_agent).await;
                 Ok(solution.response)
             }
             None => {
@@ -249,6 +273,61 @@ impl Musescore {
                     .await
                     .with_context(|| format!("musescore {ctx_label} body"))
             }
+        }
+    }
+
+    /// Attempt a direct fetch of a CF-challenged URL, replaying the
+    /// `cf_clearance` cookie (already in our jar from a prior FS solve)
+    /// under the UA that cookie is bound to. Returns `Some(html)` only on a
+    /// clean 200 that isn't a Cloudflare interstitial; every failure mode
+    /// (no UA learned yet, transport error, non-2xx, challenge page)
+    /// returns `None` so the caller transparently falls back to
+    /// FlareSolverr. This keeps the optimization regression-safe: a missing
+    /// or expired cookie costs one cheap GET, then proceeds exactly as
+    /// before.
+    async fn try_direct_clearance(&self, url: &str, ctx_label: &'static str) -> Option<String> {
+        // No UA means we've never solved, so we almost certainly hold no
+        // `cf_clearance` either — skip straight to FlareSolverr.
+        let ua = self.fs_ua.lock().await.clone()?;
+        // Per-request `User-Agent` overrides the Client's default so the
+        // header matches the (IP, UA) the cookie was issued against. The
+        // cookie itself is attached automatically by the jar.
+        let mut req = self.http.get(url).header(header::USER_AGENT, ua);
+        for (k, v) in nav_headers() {
+            req = req.header(k, v);
+        }
+        let resp = match req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(ctx = ctx_label, error = %e, "musescore direct-clearance transport error; falling back to FlareSolverr");
+                return None;
+            }
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            tracing::debug!(ctx = ctx_label, %status, "musescore direct-clearance non-success (cookie likely expired); falling back to FlareSolverr");
+            return None;
+        }
+        let body = resp.text().await.ok()?;
+        if looks_like_cf_challenge(&body) {
+            tracing::debug!(ctx = ctx_label, "musescore direct-clearance returned a CF interstitial; falling back to FlareSolverr");
+            return None;
+        }
+        tracing::debug!(ctx = ctx_label, "musescore direct-clearance hit (skipped FlareSolverr)");
+        Some(body)
+    }
+
+    /// Remember the UA FlareSolverr's Chromium used on a successful solve so
+    /// the next `try_direct_clearance` replays `cf_clearance` under the same
+    /// UA. Empty UAs (older FS builds occasionally omit the field) are
+    /// ignored so we don't poison the fast path with a blank header.
+    async fn remember_fs_ua(&self, ua: &str) {
+        if ua.is_empty() {
+            return;
+        }
+        let mut guard = self.fs_ua.lock().await;
+        if guard.as_deref() != Some(ua) {
+            *guard = Some(ua.to_string());
         }
     }
 
@@ -519,8 +598,7 @@ impl Source for Musescore {
                     // first_card_html dumps the surrounding markup of
                     // the earliest score-page link we found so we can
                     // refine selectors next round.
-                    let looks_like_cf = html.contains("Just a moment")
-                        || html.contains("Attention Required");
+                    let looks_like_cf = looks_like_cf_challenge(&html);
                     let has_data_hash = scan_for_data_hash_attr(&html);
                     let (score_link_count, first_card_html) =
                         diagnose_score_links(&html);
@@ -706,6 +784,16 @@ struct SearchScore {
     /// True for "official" publisher engravings, false for community
     /// uploads. None on the DOM-scrape fallback path.
     is_official: Option<bool>,
+}
+
+/// Heuristic for "this HTML is a Cloudflare interstitial, not the page we
+/// asked for". Covers both the JS "Just a moment…" challenge and the hard
+/// "Attention Required" block page. Cloudflare serves the challenge with a
+/// 200 (not a 403) when a `cf_clearance` cookie has expired, so the
+/// direct-clearance fast path needs this body check on top of the status
+/// check to recognise a stale cookie and fall back to FlareSolverr.
+fn looks_like_cf_challenge(html: &str) -> bool {
+    html.contains("Just a moment") || html.contains("Attention Required")
 }
 
 /// Look for the JS bundle URL that matches the upstream extension's regex:
@@ -1388,6 +1476,24 @@ mod tests {
             strip_highlight_markers("[b]Fur[/b] [b]Elise[/b]"),
             "Fur Elise"
         );
+    }
+
+    #[test]
+    fn cf_challenge_detection() {
+        // Interactive JS challenge.
+        assert!(looks_like_cf_challenge(
+            "<title>Just a moment...</title><body>checking your browser</body>"
+        ));
+        // Hard block page.
+        assert!(looks_like_cf_challenge(
+            "<h1>Attention Required! | Cloudflare</h1>"
+        ));
+        // A real search page (has score links, no challenge markers) must
+        // NOT be mistaken for a challenge, or the direct-clearance fast path
+        // would needlessly fall back to FlareSolverr on every hit.
+        assert!(!looks_like_cf_challenge(
+            "<div class=\"score\"><a href=\"/score/12345\">Für Elise</a></div>"
+        ));
     }
 
     // ----- Integration smoke test (Phase D) -----
