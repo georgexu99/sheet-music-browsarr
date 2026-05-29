@@ -1,0 +1,16 @@
+{# Deferred MuseScore block. Returned by `/search?defer=musescore&…` — the
+   second request fired by the `#musescore-deferred` loader once the fast
+   sources have already painted. Replaces the loader via
+   hx-swap="outerHTML", so this is its own <ul> (the fast results live in a
+   sibling <ul> above). `mt-3` keeps the inter-list spacing matching the
+   `space-y-3` rhythm. No infinite-scroll sentinel: MuseScore is fetched
+   once at the page-1 size and not paginated independently — keeps the
+   expensive FlareSolverr path off the "Load more" hot path. When MuseScore
+   returns nothing, we render nothing so the loader simply vanishes. #}
+{% if !results.is_empty() %}
+  <ul class="space-y-3 mt-3">
+    {% for r in results %}
+    {% include "_result_card.html" %}
+    {% endfor %}
+  </ul>
+{% endif %}

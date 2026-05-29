@@ -1,78 +1,12 @@
 {# Card list + infinite-scroll sentinel. Shared between the full results
    page (wrapped in <ul>) and the append-mode partial (bare). Both
    ResultsPartial and ResultsAppendPartial expose the same fields
-   (query, results, next_page) so this include stays context-stable. #}
+   (query, results, next_page, musescore_pending) so this include stays
+   context-stable. Each card is rendered via `_result_card.html` so the
+   deferred MuseScore block (`search_musescore.html`) reuses identical
+   markup. #}
 {% for r in results %}
-  <li>
-    <a
-      href="/pdf/{{ r.source }}/{{ r.id }}"
-      target="_blank"
-      rel="noopener"
-      class="block p-4 rounded-lg border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900/40 transition-colors no-underline text-inherit"
-    >
-      {# Compact card layout: thumbnail stays side-by-side with text even
-         on mobile (80px → 96px from sm:). Mobile-stacking the thumbnail
-         would balloon it to viewport width — much worse than the
-         existing tight 80px tile. #}
-      <div class="flex gap-3 sm:gap-4">
-        {% match r.thumbnail_url %}
-          {% when Some with (url) %}
-            {# Skeleton + smooth fade-in: the wrapper has a pulsing
-               gray background while the image streams in, then a 200ms
-               opacity transition lands on the loaded image. `onload`
-               toggles a class instead of hard-removing animate-pulse
-               so future tweaks can keep working in CSS only. #}
-            <div class="shrink-0 w-20 sm:w-24 aspect-[3/4] rounded-md bg-gray-200 dark:bg-gray-800 animate-pulse overflow-hidden">
-              <img
-                src="{{ url }}"
-                alt="Preview of {{ r.title }}"
-                loading="lazy"
-                referrerpolicy="no-referrer"
-                class="w-full h-full object-cover opacity-0 transition-opacity duration-200"
-                onload="this.classList.remove('opacity-0'); this.parentElement.classList.remove('animate-pulse');"
-                onerror="this.parentElement.classList.remove('animate-pulse'); this.style.display='none';"
-              >
-            </div>
-          {% when None %}
-            <div class="shrink-0 w-20 sm:w-24 aspect-[3/4] rounded-md bg-gray-100 dark:bg-gray-900 border border-gray-200 dark:border-gray-800 flex items-center justify-center text-gray-400 dark:text-gray-600">
-              <svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" fill="none" viewBox="0 0 24 24" stroke-width="1.5" stroke="currentColor" class="w-8 h-8" aria-hidden="true">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M9 9l10.5-3m0 6.553v3.75a2.25 2.25 0 0 1-1.632 2.163l-1.32.377a1.803 1.803 0 1 1-.99-3.467l2.31-.66a2.25 2.25 0 0 0 1.632-2.163Zm0 0V2.25L9 5.25v10.303m0 0v3.75a2.25 2.25 0 0 1-1.632 2.163l-1.32.377a1.803 1.803 0 0 1-.99-3.467l2.31-.66A2.25 2.25 0 0 0 9 15.553Z" />
-              </svg>
-            </div>
-        {% endmatch %}
-        <div class="flex-1 min-w-0">
-          <div class="flex items-start justify-between gap-3 mb-1">
-            {# `line-clamp-2` keeps even very long IMSLP titles
-               ("Symphony No. 9 in D minor, Op.125 — Complete Score
-               (Edition by Otto Klemperer)") to two visual lines so
-               card heights don't drift card-to-card. #}
-            <h2 class="text-base font-semibold leading-snug text-gray-900 dark:text-gray-100 line-clamp-2">{{ r.title }}</h2>
-            {# Source badge with a small external-link glyph hinting
-               "this opens in a new tab." 12px, baseline-aligned with
-               the badge text. #}
-            <span class="source-badge source-badge-{{ r.source }} shrink-0 inline-flex items-center gap-1">
-              {{ r.source }}
-              <svg width="12" height="12" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-                <path d="m4.5 19.5 15-15M8.25 4.5h11.25v11.25"/>
-              </svg>
-            </span>
-          </div>
-          {% if !r.metadata.is_empty() %}
-            <div class="flex flex-wrap gap-1.5 mb-2">
-              {% for m in r.metadata %}
-                <span class="meta-badge">{{ m.label }}</span>
-              {% endfor %}
-            </div>
-          {% endif %}
-          {% match r.description %}
-            {% when Some with (desc) %}
-              <p class="text-sm text-gray-500 dark:text-gray-400 leading-relaxed line-clamp-2">{{ desc }}</p>
-            {% when None %}
-          {% endmatch %}
-        </div>
-      </div>
-    </a>
-  </li>
+{% include "_result_card.html" %}
 {% endfor %}
 {# Infinite-scroll sentinel. When `next_page=Some(np)` and the sentinel
    scrolls into view, HTMX fires `?page=np&append=1`, the server returns
@@ -106,9 +40,10 @@
   {% when None %}
     {# End-of-results sentinel — only when we DID render at least one
        result above (otherwise the empty-state in search_results.html
-       carries the messaging). Quiet typographic divider rather than
-       a heavy banner. #}
-    {% if !results.is_empty() %}
+       carries the messaging) AND MuseScore isn't still streaming in
+       below us (a "End of results" divider above the pending MuseScore
+       block would read as a lie). Quiet typographic divider. #}
+    {% if !results.is_empty() && !musescore_pending %}
       <li class="py-6 flex justify-center items-center gap-3 text-xs uppercase tracking-wider text-gray-400 dark:text-gray-600 list-none" aria-hidden="true">
         <span class="h-px w-8 bg-gray-200 dark:bg-gray-800"></span>
         <span>End of results</span>

@@ -82,6 +82,19 @@ struct SearchPage {
     /// non-default, any source unticked, or PD-only on). Drives the
     /// visibility of the "Reset filters" link.
     has_active_filters: bool,
+    /// `Some(url)` when this render should embed the deferred MuseScore
+    /// loader (`<div hx-get=…>`) — i.e. the first page of a real query
+    /// with MuseScore among the selected sources. The URL hits
+    /// `/search?defer=musescore&…`. `None` suppresses the loader (home
+    /// page, MuseScore unticked, append/defer responses). See
+    /// `build_musescore_defer_url`.
+    musescore_defer_url: Option<String>,
+    /// True exactly when `musescore_defer_url` is `Some` — MuseScore is
+    /// still streaming in below. Suppresses the "End of results" divider
+    /// in the shared items partial so it doesn't render above the pending
+    /// MuseScore block. Kept as a separate flag because the items partial
+    /// can't `match` the Option in a boolean context.
+    musescore_pending: bool,
 }
 
 #[derive(Template)]
@@ -90,6 +103,17 @@ struct ResultsPartial {
     query: String,
     results: Vec<SearchResult>,
     next_page: Option<u32>,
+    musescore_defer_url: Option<String>,
+    musescore_pending: bool,
+}
+
+/// Deferred MuseScore block, returned by `/search?defer=musescore&…`.
+/// Rendered into the `#musescore-deferred` loader once the fast sources
+/// have painted. Shares `_result_card.html` with the unified list.
+#[derive(Template)]
+#[template(path = "search_musescore.html")]
+struct MusescorePartial {
+    results: Vec<SearchResult>,
 }
 
 /// Infinite-scroll append response. Same shape as `ResultsPartial` — both
@@ -102,6 +126,10 @@ struct ResultsAppendPartial {
     query: String,
     results: Vec<SearchResult>,
     next_page: Option<u32>,
+    /// Always false on the append path — MuseScore is loaded once on
+    /// page 1, never during infinite-scroll. Present only because the
+    /// shared `_search_results_items.html` references it.
+    musescore_pending: bool,
 }
 
 struct SourceFilterOption {
@@ -381,6 +409,8 @@ async fn home(State(state): State<AppState>) -> impl IntoResponse {
         instruments: ui.instruments,
         difficulties: ui.difficulties,
         score_types: ui.score_types,
+        musescore_defer_url: None,
+        musescore_pending: false,
     }
 }
 
@@ -440,6 +470,14 @@ async fn search(
     // gracefully render the full page instead of a bare fragment.
     let is_append =
         is_htmx && first_param(&params, "append").is_some_and(|s| !s.is_empty());
+    // Deferred MuseScore fan-out: the second request fired by the
+    // `#musescore-deferred` loader once the fast sources have painted.
+    // Queries MuseScore *only* and returns a bare card block. Gated on the
+    // HTMX header so a hand-typed `?defer=musescore` URL falls through to a
+    // normal full search (which includes MuseScore inline) rather than
+    // rendering an orphan fragment.
+    let is_defer =
+        is_htmx && first_param(&params, "defer") == Some("musescore");
 
     if query.is_empty() {
         audit::record(
@@ -452,6 +490,9 @@ async fn search(
             None,
         )
         .await;
+        if is_defer {
+            return MusescorePartial { results: Vec::new() }.into_response();
+        }
         if is_append {
             return empty_append(&query);
         }
@@ -463,12 +504,16 @@ async fn search(
             None,
             source_filter.as_ref(),
             &filters,
+            None,
         );
     }
     if query.chars().count() < SEARCH_MIN_QUERY_LEN {
         // Typeahead: too short to be useful and the upstream sources will
         // mostly return noise. Return an empty result set silently — the
         // user will keep typing.
+        if is_defer {
+            return MusescorePartial { results: Vec::new() }.into_response();
+        }
         if is_append {
             return empty_append(&query);
         }
@@ -480,6 +525,7 @@ async fn search(
             None,
             source_filter.as_ref(),
             &filters,
+            None,
         );
     }
 
@@ -503,6 +549,21 @@ async fn search(
         .cloned()
         .collect();
 
+    // Whether MuseScore is in play for this query at all. Drives both the
+    // deferred-loader emission (normal path) and the defer-mode fan-out.
+    let musescore_selected = selected_sources.iter().any(|s| s.id() == "musescore");
+
+    // Split the fan-out. MuseScore is the slow source (FlareSolverr) and is
+    // loaded out-of-band via `?defer=musescore`, so the normal (fast) path
+    // queries everything *except* MuseScore, and the defer path queries
+    // *only* MuseScore. This is what keeps MuseScore from being the
+    // limiting factor on first paint.
+    let active_sources: Vec<Arc<dyn Source>> = selected_sources
+        .iter()
+        .filter(|s| (s.id() == "musescore") == is_defer)
+        .cloned()
+        .collect();
+
     // Cross-product: (source, variant) -> one parallel search future.
     // Failing futures get a logged warn + empty Vec; nothing poisons the
     // whole search.
@@ -521,7 +582,7 @@ async fn search(
     //     Mutopia (cheap HTTP fetches, multilingual catalogs) keep
     //     the full variant fan-out.
     let original_query = query.clone();
-    let pairs: Vec<(Arc<dyn Source>, String)> = selected_sources
+    let pairs: Vec<(Arc<dyn Source>, String)> = active_sources
         .iter()
         .flat_map(|s| {
             let src = s.clone();
@@ -598,6 +659,16 @@ async fn search(
     // applied upstream at the source layer.
     results.retain(|r| passes_post_hoc(r, &filters));
 
+    // Deferred MuseScore block returns here: just the first page-size
+    // worth of MuseScore cards, no pagination and no audit row (the fast
+    // search already logged this query, so logging again would double-count
+    // in /admin/search_log). Per-source liveness was already recorded in
+    // the fan-out closure above.
+    if is_defer {
+        results.truncate(SEARCH_PAGE_SIZE);
+        return MusescorePartial { results }.into_response();
+    }
+
     // Page-1 shows the first SEARCH_PAGE_SIZE; page-N shows the first
     // N * SEARCH_PAGE_SIZE. We always serve the cumulative slice (the
     // "Load more" button replaces the whole `#results` div), which keeps
@@ -655,9 +726,18 @@ async fn search(
             query,
             results: new_items,
             next_page,
+            musescore_pending: false,
         }
         .into_response();
     }
+    // Emit the deferred MuseScore loader only on the first page of a real
+    // query when MuseScore is among the selected sources. Page 2+ (infinite
+    // scroll) already loaded MuseScore on page 1; appends are handled above.
+    let musescore_defer_url = if page == 1 && musescore_selected {
+        Some(build_musescore_defer_url(&query, &filters))
+    } else {
+        None
+    };
     render_response(
         is_htmx,
         &state,
@@ -666,7 +746,34 @@ async fn search(
         next_page,
         source_filter.as_ref(),
         &filters,
+        musescore_defer_url,
     )
+}
+
+/// Build the `/search?defer=musescore&…` URL the deferred loader fetches.
+/// Carries the query plus the filters MuseScore needs: `instrument` is
+/// pushed down to MuseScore's upstream facet, while difficulty / score_type
+/// / pd_only are re-applied post-hoc in the defer-mode handler. The
+/// `sources` param is intentionally omitted — defer mode forces a
+/// MuseScore-only fan-out regardless.
+fn build_musescore_defer_url(query: &str, filters: &SearchFilters) -> String {
+    let mut url = format!("/search?defer=musescore&q={}", urlencoding::encode(query));
+    if let Some(i) = filters.instrument {
+        url.push_str("&instrument=");
+        url.push_str(i.slug());
+    }
+    if let Some(d) = filters.difficulty {
+        url.push_str("&difficulty=");
+        url.push_str(d.slug());
+    }
+    if let Some(st) = filters.score_type {
+        url.push_str("&score_type=");
+        url.push_str(st.slug());
+    }
+    if filters.public_domain_only {
+        url.push_str("&pd_only=1");
+    }
+    url
 }
 
 /// Bare append partial with no items + no sentinel. Used for the
@@ -677,6 +784,7 @@ fn empty_append(query: &str) -> Response {
         query: query.to_string(),
         results: Vec::new(),
         next_page: None,
+        musescore_pending: false,
     }
     .into_response()
 }
@@ -692,12 +800,16 @@ fn render_response(
     next_page: Option<u32>,
     source_filter: Option<&HashSet<String>>,
     filters: &SearchFilters,
+    musescore_defer_url: Option<String>,
 ) -> Response {
+    let musescore_pending = musescore_defer_url.is_some();
     if is_htmx {
         ResultsPartial {
             query: query.to_string(),
             results,
             next_page,
+            musescore_defer_url,
+            musescore_pending,
         }
         .into_response()
     } else {
@@ -723,6 +835,8 @@ fn render_response(
             instruments: ui.instruments,
             difficulties: ui.difficulties,
             score_types: ui.score_types,
+            musescore_defer_url,
+            musescore_pending,
         }
         .into_response()
     }

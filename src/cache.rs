@@ -1,7 +1,8 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use moka::future::Cache;
+use moka::Expiry;
 
 use crate::sources::{Instrument, SearchFilters, SearchResult, Source};
 
@@ -27,11 +28,41 @@ pub type SearchCache = Cache<CacheKey, Arc<Vec<SearchResult>>>;
 
 const CACHE_TTL_SECS: u64 = 60;
 const CACHE_MAX_ENTRIES: u64 = 1000;
+/// MuseScore search goes through FlareSolverr — a headless-Chromium
+/// Cloudflare solve that costs 5–45 s on a cold query. A 60 s TTL would
+/// re-pay that constantly. The catalog of community uploads moves slowly
+/// and this is a low-traffic instance, so MuseScore search results get a
+/// week-long TTL; the cheap HTTP sources (IMSLP, Mutopia) keep the short
+/// 60 s freshness window.
+const MUSESCORE_CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 7;
+
+/// Per-source TTL policy keyed off the static source id already carried in
+/// `CacheKey`. MuseScore entries live a week; everything else expires after
+/// `CACHE_TTL_SECS`. We only need `expire_after_create` — entries are never
+/// updated in place (cache-aside replaces them wholesale on miss) and a read
+/// shouldn't extend the lifetime, so the trait's other hooks keep their
+/// no-op defaults.
+struct SearchExpiry;
+
+impl Expiry<CacheKey, Arc<Vec<SearchResult>>> for SearchExpiry {
+    fn expire_after_create(
+        &self,
+        key: &CacheKey,
+        _value: &Arc<Vec<SearchResult>>,
+        _created_at: Instant,
+    ) -> Option<Duration> {
+        Some(if key.source == "musescore" {
+            Duration::from_secs(MUSESCORE_CACHE_TTL_SECS)
+        } else {
+            Duration::from_secs(CACHE_TTL_SECS)
+        })
+    }
+}
 
 pub fn new_search_cache() -> SearchCache {
     Cache::builder()
         .max_capacity(CACHE_MAX_ENTRIES)
-        .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
+        .expire_after(SearchExpiry)
         .build()
 }
 
