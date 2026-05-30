@@ -168,6 +168,16 @@ pub struct Musescore {
     /// the steady-state search/score-page fetch from a multi-second
     /// headless-Chromium round-trip into a sub-second HTTP call.
     fs_ua: Mutex<Option<String>>,
+    /// Single-flight gate around the FlareSolverr solve. The i18n layer
+    /// fans one user query into up to 4 CJK variants that reach
+    /// `fetch_html_challenged` in parallel; the search-cache single-flight
+    /// keys on `(source, variant)` so it does NOT coalesce them, and at
+    /// every cold-start / cookie-expiry boundary each variant would
+    /// otherwise launch its own 5–30 s headless-Chromium solve. Serializing
+    /// the *decision to solve* lets the first caller mint the `cf_clearance`;
+    /// the rest wake, replay it via `try_direct_clearance`, and skip
+    /// FlareSolverr entirely. Only the leader pays the solve cost.
+    fs_solve_lock: Mutex<()>,
     cached: Mutex<Option<CachedAlgorithm>>,
     /// Unix timestamp (seconds) of the last user-driven search / PDF fetch,
     /// or 0 if none yet. Read by the keep-warm loop to decide whether the
@@ -250,6 +260,7 @@ impl Musescore {
             fs_sessions,
             fs_session_cursor: AtomicUsize::new(0),
             fs_ua: Mutex::new(None),
+            fs_solve_lock: Mutex::new(()),
             cached: Mutex::new(None),
             last_activity: AtomicI64::new(0),
         })
@@ -514,6 +525,20 @@ impl Musescore {
                 // UA (our proxy for "we've solved at least once"); a
                 // stale/expired cookie just 403s or returns the challenge
                 // page, and we fall through to the FlareSolverr path below.
+                if let Some(html) = self.try_direct_clearance(url, ctx_label).await {
+                    return Ok(html);
+                }
+
+                // Slow path. Coalesce concurrent solvers: the i18n fan-out
+                // lands up to 4 variants here at once when the cookie's
+                // stale, but only one needs to drive FlareSolverr. Hold the
+                // solve gate, then re-check the fast path — a peer solve that
+                // landed while we were queued has already refreshed the jar +
+                // UA, so our replay now succeeds and we skip the redundant
+                // headless-Chromium round-trip. The guard stays held through
+                // the absorb/remember below so waiters only wake once the
+                // fresh cookie + UA are actually in place.
+                let _solve_guard = self.fs_solve_lock.lock().await;
                 if let Some(html) = self.try_direct_clearance(url, ctx_label).await {
                     return Ok(html);
                 }
