@@ -6,6 +6,7 @@ pub mod health;
 pub mod imslp;
 pub mod musescore;
 pub mod mutopia;
+pub mod ultimate_guitar;
 
 /// User-selectable instrument filter. Each source decides how to apply it:
 /// Mutopia maps to its native `Instrument` CGI facet, MuseScore to its

@@ -21,7 +21,7 @@
  * are emitted via `class="source-badge source-badge-{{ source }}"` in
  * search_results.html. Listing them in @source lets v4 keep them even
  * when the dynamic class doesn't show up as a literal. */
-@source inline("{source-badge,source-badge-imslp,source-badge-mutopia,source-badge-musescore}");
+@source inline("{source-badge,source-badge-imslp,source-badge-mutopia,source-badge-musescore,source-badge-ultimate-guitar}");
 
 /* Belt-and-suspenders: force-include the dark-mode utility set the
  * layout actually uses. The theme toggle in base.html flips a `dark`
@@ -86,6 +86,9 @@
   }
   .source-badge-musescore {
     @apply bg-orange-100 text-orange-800 dark:bg-orange-950 dark:text-orange-200;
+  }
+  .source-badge-ultimate-guitar {
+    @apply bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-200;
   }
   /* Per-result metadata pills (pages, instrument, key, year, ...). One
    * neutral gray palette across all BadgeKind variants — they're context,

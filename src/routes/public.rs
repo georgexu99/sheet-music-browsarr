@@ -89,12 +89,17 @@ struct SearchPage {
     /// page, MuseScore unticked, append/defer responses). See
     /// `build_musescore_defer_url`.
     musescore_defer_url: Option<String>,
-    /// True exactly when `musescore_defer_url` is `Some` — MuseScore is
-    /// still streaming in below. Suppresses the "End of results" divider
+    /// True exactly when `musescore_defer_url` is `Some` — a deferred source
+    /// is still streaming in below. Suppresses the "End of results" divider
     /// in the shared items partial so it doesn't render above the pending
-    /// MuseScore block. Kept as a separate flag because the items partial
+    /// deferred block. Kept as a separate flag because the items partial
     /// can't `match` the Option in a boolean context.
     musescore_pending: bool,
+    /// Human label for the deferred loader, e.g. "MuseScore",
+    /// "Ultimate Guitar", or "MuseScore & Ultimate Guitar" — whichever
+    /// deferred sources are currently selected. Only shown when the loader
+    /// renders (i.e. `musescore_defer_url` is `Some`).
+    deferred_label: String,
 }
 
 #[derive(Template)]
@@ -105,6 +110,7 @@ struct ResultsPartial {
     next_page: Option<u32>,
     musescore_defer_url: Option<String>,
     musescore_pending: bool,
+    deferred_label: String,
 }
 
 /// Deferred MuseScore block, returned by `/search?defer=musescore&…`.
@@ -208,6 +214,15 @@ fn build_filter_options(
         difficulties,
         score_types,
     }
+}
+
+/// True for sources that go through FlareSolverr (a slow headless-Chromium
+/// solve on a cold `cf_clearance`). These are loaded *out-of-band* via the
+/// `?defer=musescore` channel so they never block first paint; the fast path
+/// queries everything else. Adding a new CF-backed source means adding its id
+/// here.
+fn is_deferred_source(id: &str) -> bool {
+    matches!(id, "musescore" | "ultimate-guitar")
 }
 
 /// Post-hoc filter: drop results that don't match the difficulty / PD-only
@@ -411,6 +426,7 @@ async fn home(State(state): State<AppState>) -> impl IntoResponse {
         score_types: ui.score_types,
         musescore_defer_url: None,
         musescore_pending: false,
+        deferred_label: String::new(),
     }
 }
 
@@ -548,18 +564,21 @@ async fn search(
         .cloned()
         .collect();
 
-    // Whether MuseScore is in play for this query at all. Drives both the
-    // deferred-loader emission (normal path) and the defer-mode fan-out.
-    let musescore_selected = selected_sources.iter().any(|s| s.id() == "musescore");
+    // Whether any *deferred* (slow, FlareSolverr-backed) source is in play for
+    // this query. Drives both the deferred-loader emission (normal path) and
+    // the defer-mode fan-out.
+    let deferred_selected = selected_sources
+        .iter()
+        .any(|s| is_deferred_source(s.id()));
 
-    // Split the fan-out. MuseScore is the slow source (FlareSolverr) and is
-    // loaded out-of-band via `?defer=musescore`, so the normal (fast) path
-    // queries everything *except* MuseScore, and the defer path queries
-    // *only* MuseScore. This is what keeps MuseScore from being the
-    // limiting factor on first paint.
+    // Split the fan-out. The CF-challenged sources (MuseScore, Ultimate
+    // Guitar) are slow (FlareSolverr) and are loaded out-of-band via
+    // `?defer=musescore`, so the normal (fast) path queries everything
+    // *except* those, and the defer path queries *only* those. This is what
+    // keeps the slow sources from being the limiting factor on first paint.
     let active_sources: Vec<Arc<dyn Source>> = selected_sources
         .iter()
-        .filter(|s| (s.id() == "musescore") == is_defer)
+        .filter(|s| is_deferred_source(s.id()) == is_defer)
         .cloned()
         .collect();
 
@@ -567,25 +586,25 @@ async fn search(
     // Failing futures get a logged warn + empty Vec; nothing poisons the
     // whole search.
     //
-    // Exception: MuseScore only gets the user's original query, never
-    // the CJK variant expansions. Reasoning:
-    //   - MuseScore.com sits behind Cloudflare; we go through
-    //     FlareSolverr, where each call spins up (or queues against)
-    //     a headless Chromium that takes ~5–30 s.
-    //   - 4 variants × MuseScore = 4 parallel FS calls per query,
-    //     which routinely overflows FS's internal queue (depths of
-    //     8–12) and trips timeouts.
-    //   - MuseScore's catalog is overwhelmingly English-titled
-    //     community uploads — the CJK variants find very few extra
-    //     hits there relative to the load they generate. IMSLP and
-    //     Mutopia (cheap HTTP fetches, multilingual catalogs) keep
-    //     the full variant fan-out.
+    // Exception: the CF-challenged sources (MuseScore, Ultimate Guitar) only
+    // get the user's original query, never the CJK variant expansions.
+    // Reasoning:
+    //   - Both sit behind Cloudflare; we go through FlareSolverr, where each
+    //     call spins up (or queues against) a headless Chromium that takes
+    //     ~5–30 s.
+    //   - 4 variants × source = 4 parallel FS calls per query, which
+    //     routinely overflows FS's internal queue (depths of 8–12) and trips
+    //     timeouts.
+    //   - Their catalogs are overwhelmingly English-titled — the CJK variants
+    //     find very few extra hits relative to the load they generate. IMSLP
+    //     and Mutopia (cheap HTTP fetches, multilingual catalogs) keep the
+    //     full variant fan-out.
     let original_query = query.clone();
     let pairs: Vec<(Arc<dyn Source>, String)> = active_sources
         .iter()
         .flat_map(|s| {
             let src = s.clone();
-            if src.id() == "musescore" {
+            if is_deferred_source(src.id()) {
                 vec![(src, original_query.clone())]
             } else {
                 variants
@@ -604,23 +623,25 @@ async fn search(
     // 20-per-source vec.
     let per_source_limit = SEARCH_LIMIT_PER_SOURCE * (page as usize);
 
-    // Prewarm: kick the slow MuseScore search in the background *now*, so by
-    // the time the browser fires the deferred `?defer=musescore` request it
-    // lands on a warm cache instead of a cold FlareSolverr solve. Gated to the
-    // same condition that emits the deferred loader (first page of a real
-    // query with MuseScore selected) and skipped in defer mode (that request
-    // *is* the MuseScore fetch). The single-flight in `cached_search`
-    // collapses this and the deferred request into one upstream call, and the
-    // query/limit/instrument match the deferred request's cache key exactly.
-    if !is_defer && !is_append && page == 1 && musescore_selected {
-        if let Some(ms) = state.find_source("musescore") {
+    // Prewarm: kick each slow (deferred) source's search in the background
+    // *now*, so by the time the browser fires the deferred `?defer=musescore`
+    // request it lands on a warm cache instead of a cold FlareSolverr solve.
+    // Gated to the same condition that emits the deferred loader (first page
+    // of a real query with a deferred source selected) and skipped in defer
+    // mode (that request *is* the deferred fetch). The single-flight in
+    // `cached_search` collapses this and the deferred request into one
+    // upstream call, and the query/limit/instrument match the deferred
+    // request's cache key exactly.
+    if !is_defer && !is_append && page == 1 && deferred_selected {
+        for src in selected_sources.iter().filter(|s| is_deferred_source(s.id())) {
+            let src = src.clone();
             let cache = search_cache.clone();
             let l2 = search_cache_l2.clone();
             let q = query.clone();
             let f = filters.clone();
             tokio::spawn(async move {
                 let _ =
-                    cache::cached_search(&cache, l2.as_ref(), &ms, &q, &f, per_source_limit).await;
+                    cache::cached_search(&cache, l2.as_ref(), &src, &q, &f, per_source_limit).await;
             });
         }
     }
@@ -752,10 +773,11 @@ async fn search(
         }
         .into_response();
     }
-    // Emit the deferred MuseScore loader only on the first page of a real
-    // query when MuseScore is among the selected sources. Page 2+ (infinite
-    // scroll) already loaded MuseScore on page 1; appends are handled above.
-    let musescore_defer_url = if page == 1 && musescore_selected {
+    // Emit the deferred loader only on the first page of a real query when a
+    // deferred (slow CF) source — MuseScore or Ultimate Guitar — is among the
+    // selected sources. Page 2+ (infinite scroll) already loaded them on page
+    // 1; appends are handled above.
+    let musescore_defer_url = if page == 1 && deferred_selected {
         Some(build_musescore_defer_url(&query, &filters))
     } else {
         None
@@ -825,6 +847,7 @@ fn render_response(
     musescore_defer_url: Option<String>,
 ) -> Response {
     let musescore_pending = musescore_defer_url.is_some();
+    let deferred_label = deferred_sources_label(state, source_filter);
     if is_htmx {
         ResultsPartial {
             query: query.to_string(),
@@ -832,6 +855,7 @@ fn render_response(
             next_page,
             musescore_defer_url,
             musescore_pending,
+            deferred_label,
         }
         .into_response()
     } else {
@@ -859,9 +883,29 @@ fn render_response(
             score_types: ui.score_types,
             musescore_defer_url,
             musescore_pending,
+            deferred_label,
         }
         .into_response()
     }
+}
+
+/// Build the deferred-loader label from the selected deferred sources'
+/// display names ("MuseScore & Ultimate Guitar"). Computed from the same
+/// source-filter the fan-out uses, so it always matches what's actually
+/// being fetched in the deferred block.
+fn deferred_sources_label(state: &AppState, source_filter: Option<&HashSet<String>>) -> String {
+    state
+        .sources
+        .iter()
+        .filter(|s| is_deferred_source(s.id()))
+        .filter(|s| {
+            source_filter
+                .map(|f| f.contains(s.id()))
+                .unwrap_or(true)
+        })
+        .map(|s| s.display_name())
+        .collect::<Vec<_>>()
+        .join(" & ")
 }
 
 async fn pdf_handler(

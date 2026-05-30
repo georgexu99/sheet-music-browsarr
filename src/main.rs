@@ -41,8 +41,13 @@ async fn main() -> anyhow::Result<()> {
     let imslp = sources::imslp::Imslp::new()?;
     let mutopia = sources::mutopia::Mutopia::new()?;
     let musescore = sources::musescore::Musescore::new()?;
-    let sources: Vec<Arc<dyn sources::Source>> =
-        vec![Arc::new(imslp), Arc::new(mutopia), Arc::new(musescore)];
+    let ultimate_guitar = sources::ultimate_guitar::UltimateGuitar::new()?;
+    let sources: Vec<Arc<dyn sources::Source>> = vec![
+        Arc::new(imslp),
+        Arc::new(mutopia),
+        Arc::new(musescore),
+        Arc::new(ultimate_guitar),
+    ];
     let source_ids: Vec<&'static str> = sources.iter().map(|s| s.id()).collect();
     let source_health = sources::health::new(&source_ids);
     let secrets = secrets::Secrets::new(&cfg.secret_key)?;
