@@ -109,12 +109,65 @@ struct FsRequest<'a> {
     session: Option<&'a str>,
 }
 
-/// Request body for the `sessions.create` command. Mirrors `request.get`
-/// minus the URL — FlareSolverr just allocates the browser context.
+/// Request body for `sessions.create` / `sessions.destroy`. Both commands
+/// take the same shape (just a session ID), so the struct is shared.
 #[derive(Serialize)]
-struct FsSessionCreate<'a> {
+struct FsSessionCmd<'a> {
     cmd: &'a str,
     session: &'a str,
+}
+
+/// Typed error for FlareSolverr `request.get` calls. The caller cares
+/// about two cases: (a) the session it referenced no longer exists
+/// (FS restarted, nightly refresh destroyed it, or a session leaked
+/// memory and was reaped), so it should recreate and retry; (b)
+/// everything else, which is just bubbled up.
+#[derive(Debug)]
+pub enum FsError {
+    /// FS reported the session ID is unknown. The string is the
+    /// session ID that was rejected so the caller can null out the
+    /// matching pool slot before retrying.
+    SessionMissing { session: String },
+    /// FS returned a non-`ok` envelope status that wasn't a missing
+    /// session — e.g., challenge timeout, browser crash, malformed URL.
+    Status {
+        status: String,
+        message: Option<String>,
+    },
+    /// FS returned `ok` but no solution payload. Should never happen
+    /// in practice; kept distinct so the operator sees the exact
+    /// failure mode in logs.
+    NoSolution,
+    /// HTTP/transport failure talking to FS itself (connect refused,
+    /// timeout, bad JSON). Wraps the underlying error.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for FsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SessionMissing { session } => {
+                write!(f, "flaresolverr session missing: {session}")
+            }
+            Self::Status { status, message } => {
+                write!(
+                    f,
+                    "flaresolverr returned status={status} message={message:?}"
+                )
+            }
+            Self::NoSolution => write!(f, "flaresolverr returned no solution"),
+            Self::Other(e) => write!(f, "{e:#}"),
+        }
+    }
+}
+
+impl std::error::Error for FsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Other(e) => e.source(),
+            _ => None,
+        }
+    }
 }
 
 impl FlareSolverr {
@@ -133,7 +186,7 @@ impl FlareSolverr {
     /// overloads FS and times out.
     pub async fn create_session(&self, session: &str) -> anyhow::Result<()> {
         let endpoint = format!("{}/v1", self.base_url);
-        let body = FsSessionCreate {
+        let body = FsSessionCmd {
             cmd: "sessions.create",
             session,
         };
@@ -159,13 +212,55 @@ impl FlareSolverr {
         Ok(())
     }
 
+    /// Destroy a previously-created session. Best-effort: a "session
+    /// doesn't exist" reply is treated as success since the postcondition
+    /// (no such session on FS) is what we wanted anyway. Used by the
+    /// nightly refresh loop before recreating a slot with the same name,
+    /// and as a hygiene measure if we ever wire in graceful shutdown.
+    pub async fn destroy_session(&self, session: &str) -> anyhow::Result<()> {
+        let endpoint = format!("{}/v1", self.base_url);
+        let body = FsSessionCmd {
+            cmd: "sessions.destroy",
+            session,
+        };
+        let env: FsEnvelope = self
+            .http
+            .post(&endpoint)
+            .json(&body)
+            .send()
+            .await
+            .context("flaresolverr sessions.destroy request")?
+            .error_for_status()
+            .context("flaresolverr sessions.destroy HTTP status")?
+            .json()
+            .await
+            .context("flaresolverr sessions.destroy json")?;
+        if env.status == "ok" {
+            return Ok(());
+        }
+        // FS replies with `error` + a message like "Session 'foo' doesn't
+        // exist." when we destroy a session that was already gone. That's
+        // not a real failure for our purposes — the slot is already in the
+        // state we wanted.
+        if let Some(msg) = &env.message {
+            if is_missing_session_message(msg) {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "flaresolverr sessions.destroy status={} message={:?}",
+            env.status,
+            env.message
+        );
+    }
+
     /// Issue a GET through FlareSolverr. Bubbles up the FS error on
     /// non-`ok` status so the caller's error path treats CF failures
     /// uniformly with direct-fetch failures. When `session` is Some,
     /// FS reuses the persistent browser context created earlier via
     /// `create_session` — drastically faster than the default
     /// ephemeral mode for repeated calls.
-    pub async fn get(&self, url: &str, session: Option<&str>) -> anyhow::Result<FsSolution> {
+    pub async fn get(&self, url: &str, session: Option<&str>) -> Result<FsSolution, FsError> {
         let endpoint = format!("{}/v1", self.base_url);
         let body = FsRequest {
             cmd: "request.get",
@@ -179,20 +274,48 @@ impl FlareSolverr {
             .json(&body)
             .send()
             .await
-            .context("flaresolverr request")?
+            .context("flaresolverr request")
+            .map_err(FsError::Other)?
             .error_for_status()
-            .context("flaresolverr HTTP status")?
+            .context("flaresolverr HTTP status")
+            .map_err(FsError::Other)?
             .json()
             .await
-            .context("flaresolverr response json")?;
+            .context("flaresolverr response json")
+            .map_err(FsError::Other)?;
         if env.status != "ok" {
-            anyhow::bail!(
-                "flaresolverr returned status={} message={:?}",
-                env.status,
-                env.message
-            );
+            // The most actionable failure mode is "session doesn't
+            // exist": the nightly refresh just deleted our slot, or FS
+            // restarted, or our session leaked. Surface it distinctly
+            // so the caller can null the slot and retry with a fresh
+            // session ID — much faster than failing the user request.
+            if let (Some(session_id), Some(msg)) = (session, &env.message) {
+                if is_missing_session_message(msg) {
+                    return Err(FsError::SessionMissing {
+                        session: session_id.to_string(),
+                    });
+                }
+            }
+            return Err(FsError::Status {
+                status: env.status,
+                message: env.message,
+            });
         }
-        env.solution
-            .ok_or_else(|| anyhow::anyhow!("flaresolverr returned no solution"))
+        env.solution.ok_or(FsError::NoSolution)
     }
+}
+
+/// FlareSolverr's reply for an unknown session looks like
+/// `"Error: This session does not exist."` (with minor wording variation
+/// across versions — "doesn't exist", "not found", etc.). Match
+/// case-insensitively on the family rather than the exact string so a
+/// future FS rewording doesn't silently turn a recoverable failure into
+/// a hard error.
+fn is_missing_session_message(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.contains("session")
+        && (m.contains("does not exist")
+            || m.contains("doesn't exist")
+            || m.contains("not found")
+            || m.contains("no such session"))
 }

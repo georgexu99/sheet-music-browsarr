@@ -40,11 +40,16 @@ async fn main() -> anyhow::Result<()> {
 
     let imslp = sources::imslp::Imslp::new()?;
     let mutopia = sources::mutopia::Mutopia::new()?;
+    // MuseScore is held as a concrete Arc<Musescore> (not erased to
+    // Arc<dyn Source>) long enough to kick off two background tasks that
+    // need the concrete type: cookie keep-warm (so user requests stay on
+    // the fast direct-replay path) and FS session-pool refresh (nightly
+    // recycle of the long-lived Chromium contexts). After that it's
+    // cloned into the type-erased registry like every other source.
+    // Both spawns no-op when FLARESOLVERR_URL is unset.
     let musescore = Arc::new(sources::musescore::Musescore::new()?);
-    // Warm (and keep warm) the Cloudflare `cf_clearance` cookie out of band so
-    // user requests land on the fast direct-replay path instead of a cold
-    // FlareSolverr solve. No-op when FLARESOLVERR_URL is unset.
     Arc::clone(&musescore).spawn_warm_tasks();
+    Arc::clone(&musescore).spawn_session_refresh();
     let ultimate_guitar = sources::ultimate_guitar::UltimateGuitar::new()?;
     let sources: Vec<Arc<dyn sources::Source>> = vec![
         Arc::new(imslp),

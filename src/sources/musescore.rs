@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,13 +13,31 @@ use scraper::{Html, Selector};
 use serde::Deserialize;
 use tokio::sync::Mutex;
 
-use super::flaresolverr::{FlareSolverr, FsSolution};
+use super::flaresolverr::{FlareSolverr, FsError, FsSolution};
 use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
 
 /// Env var name. When set, MuseScore's Cloudflare-challenged GETs go
 /// through FlareSolverr (the score-page and the /sheetmusic search page).
 /// Bundle JS, /api/jmuse, and CDN PNG fetches stay direct.
 const FLARESOLVERR_ENV: &str = "FLARESOLVERR_URL";
+
+/// Env var controlling the FlareSolverr session pool size. Each session
+/// holds a long-lived Chromium browser context on the FS side, so
+/// `N` sessions = up to `N` parallel solves (FS internally serializes
+/// per session). 3 is a sensible default for a typical homelab FS
+/// container: enough to cover the 4-CJK-variant fan-out with some
+/// headroom, without paying for browsers we never use. Bumping past
+/// ~6 starts to stress FS's RAM budget; lowering to 1 mirrors the
+/// pre-pool single-session behavior.
+const FLARESOLVERR_POOL_ENV: &str = "FLARESOLVERR_POOL_SIZE";
+const FLARESOLVERR_POOL_DEFAULT: usize = 3;
+
+/// How often the background task destroys + recreates every session in
+/// the pool. FlareSolverr's bundled Chromium has a slow memory leak
+/// over days of uptime; recycling daily keeps each browser fresh
+/// without disrupting steady-state traffic (refresh is serial, so at
+/// most one pool slot is unavailable at any moment).
+const FS_SESSION_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 3600);
 
 // MuseScore.com sits behind Cloudflare; stale or obvious-bot UAs get the
 // "Just a moment…" challenge page (HTTP 403). The full set of headers a
@@ -124,15 +142,22 @@ pub struct Musescore {
     /// set at startup; None otherwise. `fetch_html_challenged()` routes
     /// through it when present and falls back to direct otherwise.
     fs: Option<FlareSolverr>,
-    /// Lazily-created FS session ID. The first FS-routed request
-    /// creates the session (FS allocates a persistent Chromium
-    /// browser context), and subsequent requests pass the same ID so
-    /// FS reuses the context instead of cold-starting per call. Big
-    /// win for the 4-CJK-variant fan-out — without sessions FS would
-    /// see 4 parallel cold Chromium navigations per query and routinely
-    /// time out. `None` until the first successful session create;
-    /// stays `None` if create ever fails so we degrade to sessionless.
-    fs_session: Mutex<Option<String>>,
+    /// Pool of lazily-created FS session IDs. Each slot is a long-lived
+    /// Chromium browser context on the FS side. FS serializes calls
+    /// per session, so parallelism scales with pool size: with 3 slots
+    /// the 4-CJK-variant search fan-out lands on 3 different sessions
+    /// concurrently (4th waits behind one), versus serializing on a
+    /// single session pre-pool. A slot is None until first use OR
+    /// after invalidation (FS reported session-missing, refresh task
+    /// destroyed it); the next acquire on that slot recreates it. Empty
+    /// vec when `fs` is None — keeps the no-FS code path cost-free.
+    fs_sessions: Vec<Mutex<Option<String>>>,
+    /// Round-robin cursor into `fs_sessions`. Incremented on every
+    /// acquire and reduced mod pool size. Relaxed ordering is fine —
+    /// occasional slot-skipping under contention doesn't affect
+    /// correctness, just fairness, and the pool is small enough that
+    /// drift evens out within a handful of requests.
+    fs_session_cursor: AtomicUsize,
     /// The User-Agent FlareSolverr's bundled Chromium reported on the most
     /// recent successful solve. `cf_clearance` is bound to the (IP, UA)
     /// tuple, so a direct cookie-replay fetch MUST send this exact UA or
@@ -202,11 +227,28 @@ impl Musescore {
             }
         };
 
+        // Pool size is read once at startup; changing it requires a
+        // container restart. Cap at 1 — a zero-sized pool would mean
+        // "FS is configured but unusable", which the caller can't
+        // distinguish from "no FS at all" without extra branches.
+        let pool_size = std::env::var(FLARESOLVERR_POOL_ENV)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.max(1))
+            .unwrap_or(FLARESOLVERR_POOL_DEFAULT);
+        let fs_sessions: Vec<Mutex<Option<String>>> = if fs.is_some() {
+            tracing::info!(pool_size, "MuseScore: FlareSolverr session pool configured");
+            (0..pool_size).map(|_| Mutex::new(None)).collect()
+        } else {
+            Vec::new()
+        };
+
         Ok(Self {
             http,
             jar,
             fs,
-            fs_session: Mutex::new(None),
+            fs_sessions,
+            fs_session_cursor: AtomicUsize::new(0),
             fs_ua: Mutex::new(None),
             cached: Mutex::new(None),
             last_activity: AtomicI64::new(0),
@@ -266,16 +308,63 @@ impl Musescore {
         });
     }
 
+    /// Spawn the background task that refreshes every FS session in the
+    /// pool. Runs the first sweep immediately (so the pool is pre-warmed
+    /// — first user search doesn't pay the create cost), then sleeps
+    /// 24h between sweeps. No-op when FS isn't configured.
+    ///
+    /// Complementary to `spawn_warm_tasks`: that one keeps the
+    /// `cf_clearance` cookie hot so user requests stay on the fast
+    /// direct-replay path. This one keeps the FS-side Chromium
+    /// browser contexts hot so when we *do* need to solve, we don't
+    /// pay browser cold-start. Both no-op when FS isn't wired.
+    ///
+    /// Takes `Arc<Self>` so the spawned task can outlive the caller's
+    /// reference. Caller is expected to keep its own `Arc` (the source
+    /// registry does this already), so we don't bother with a weak ref:
+    /// when the process shuts down, tokio drops the task with the
+    /// runtime.
+    pub fn spawn_session_refresh(self: Arc<Self>) {
+        if self.fs.is_none() || self.fs_sessions.is_empty() {
+            return;
+        }
+        tokio::spawn(async move {
+            // Pre-warm immediately. We hit each slot serially rather
+            // than racing them so FS isn't asked to launch N browsers
+            // simultaneously at startup (it handles that, but it's
+            // wasteful — staggering by a few seconds is gentler and
+            // any in-flight user request can land on an already-warm
+            // earlier slot while later ones are still booting).
+            for idx in 0..self.fs_sessions.len() {
+                self.refresh_one_session(idx).await;
+            }
+            loop {
+                tokio::time::sleep(FS_SESSION_REFRESH_INTERVAL).await;
+                tracing::info!("FlareSolverr session refresh: nightly sweep starting");
+                for idx in 0..self.fs_sessions.len() {
+                    self.refresh_one_session(idx).await;
+                }
+                tracing::info!("FlareSolverr session refresh: nightly sweep complete");
+            }
+        });
+    }
+
     /// Force a fresh `cf_clearance` by solving through FlareSolverr,
     /// deliberately bypassing the direct-replay fast path (a still-valid but
     /// aging cookie would otherwise short-circuit and never get refreshed).
     /// Harvests the new cookie + UA into the shared jar exactly like a normal
     /// challenged fetch. No-op when FlareSolverr isn't configured.
+    ///
+    /// Uses one slot from the session pool via `acquire_session` — keep-warm
+    /// is best-effort, so we don't bother with the user-path retry on
+    /// `SessionMissing`: a transient session-missing here just means the
+    /// next 15-min tick will succeed on a different (or freshly recreated)
+    /// slot.
     async fn force_warm(&self) -> anyhow::Result<()> {
         let Some(fs) = self.fs.as_ref() else {
             return Ok(());
         };
-        let session = self.ensure_fs_session().await;
+        let session = self.acquire_session().await;
         let solution = fs
             .get(WARM_URL, session.as_deref())
             .await
@@ -302,36 +391,102 @@ impl Musescore {
         now_unix().saturating_sub(self.last_activity.load(Ordering::Relaxed))
     }
 
-    /// Return the FS session ID for `cmd: request.get`, creating it
-    /// on first use. If session creation fails (FS unreachable, bad
-    /// config, broken Chromium) we return None and the caller will
-    /// degrade to sessionless requests — slower but functional.
-    /// Errors are logged once at warn level; we don't retry within
-    /// a single startup since a persistently-broken FS would just
-    /// burn time on every search.
-    async fn ensure_fs_session(&self) -> Option<String> {
+    /// Destroy the session currently in slot `idx` (if any) and create
+    /// a fresh one in its place. Holds the slot's mutex throughout, so
+    /// any concurrent acquire waits and then sees the new session ID —
+    /// no torn reads. The slot stays unavailable for the duration of
+    /// one destroy + one create call (~2–10 s); pool-mates handle
+    /// traffic in the meantime.
+    async fn refresh_one_session(&self, idx: usize) {
+        let Some(fs) = self.fs.as_ref() else { return };
+        let Some(slot) = self.fs_sessions.get(idx) else {
+            return;
+        };
+        let mut guard = slot.lock().await;
+        if let Some(old) = guard.take() {
+            if let Err(e) = fs.destroy_session(&old).await {
+                // Best-effort. A failed destroy mostly means FS doesn't
+                // know about the session anymore (restart, manual purge),
+                // which is what we wanted anyway.
+                tracing::debug!(
+                    session = %old,
+                    error = %format!("{:#}", e),
+                    "FlareSolverr session destroy failed during refresh; continuing"
+                );
+            }
+        }
+        let new_id = format!("musescore-{idx}");
+        match fs.create_session(&new_id).await {
+            Ok(()) => {
+                tracing::info!(session = %new_id, "FlareSolverr session created");
+                *guard = Some(new_id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    idx,
+                    error = %format!("{:#}", e),
+                    "FlareSolverr session create failed; slot left empty (will retry on next acquire)"
+                );
+            }
+        }
+    }
+
+    /// Pick a session from the pool using round-robin and return its
+    /// ID, creating one on demand if this slot is empty (first hit, or
+    /// a prior `invalidate_session` cleared it). Returns `None` when
+    /// FS isn't configured or the create attempt failed — caller
+    /// degrades to sessionless mode in that case.
+    ///
+    /// The mutex is held across the create call so concurrent first-
+    /// callers for the same slot serialize on each other. With a pool
+    /// of size N, you can still have up to N create calls in flight
+    /// concurrently (one per slot), but you won't issue 4 redundant
+    /// creates for the same slot under a burst.
+    async fn acquire_session(&self) -> Option<String> {
         let fs = self.fs.as_ref()?;
-        let mut guard = self.fs_session.lock().await;
+        if self.fs_sessions.is_empty() {
+            return None;
+        }
+        let idx = self.fs_session_cursor.fetch_add(1, Ordering::Relaxed) % self.fs_sessions.len();
+        let slot = &self.fs_sessions[idx];
+        let mut guard = slot.lock().await;
         if let Some(s) = guard.as_ref() {
             return Some(s.clone());
         }
-        // Use a stable session name so the FS-side context persists
-        // across our process's lifetime. Concurrent first-callers
-        // race on the lock, so only one create_session HTTP call
-        // happens even under bursty traffic.
-        let session_id = "musescore".to_string();
+        let session_id = format!("musescore-{idx}");
         match fs.create_session(&session_id).await {
             Ok(()) => {
-                tracing::info!(session = %session_id, "FlareSolverr session created");
+                tracing::info!(session = %session_id, "FlareSolverr session created (on-demand)");
                 *guard = Some(session_id.clone());
                 Some(session_id)
             }
             Err(e) => {
                 tracing::warn!(
+                    idx,
                     error = %format!("{:#}", e),
-                    "FlareSolverr session create failed; falling back to sessionless mode"
+                    "FlareSolverr session create failed; falling back to sessionless mode for this request"
                 );
                 None
+            }
+        }
+    }
+
+    /// Null out whichever pool slot is currently holding `session`. Called
+    /// after FS reports `SessionMissing` so the next acquire for that slot
+    /// recreates it, instead of the caller repeatedly trying a dead ID.
+    /// O(N) over the small pool — cheaper than mapping session → slot at
+    /// the cost of keeping the data structure flat.
+    async fn invalidate_session(&self, session: &str) {
+        for (idx, slot) in self.fs_sessions.iter().enumerate() {
+            let mut guard = slot.lock().await;
+            if guard.as_deref() == Some(session) {
+                tracing::info!(
+                    session,
+                    idx,
+                    "FlareSolverr session invalidated; will recreate on next use"
+                );
+                *guard = None;
+                return;
             }
         }
     }
@@ -341,6 +496,13 @@ impl Musescore {
     /// the FS response are injected into our shared jar so subsequent
     /// direct fetches (bundle JS, /api/jmuse, CDN PNGs) carry the
     /// `cf_clearance` if MuseScore expands CF coverage to those paths.
+    ///
+    /// FS call has up to two attempts: if the first one returns
+    /// `SessionMissing` (nightly refresh just destroyed our slot, FS
+    /// restarted, or our session leaked between acquire and use), we
+    /// invalidate that slot and retry with a freshly-created session.
+    /// Other errors fail fast — they're typically challenge timeouts or
+    /// transport errors, which retrying wouldn't fix.
     async fn fetch_html_challenged(&self, url: &str, ctx_label: &'static str) -> anyhow::Result<String> {
         match &self.fs {
             Some(fs) => {
@@ -356,21 +518,45 @@ impl Musescore {
                     return Ok(html);
                 }
 
-                let session = self.ensure_fs_session().await;
-                let solution: FsSolution = fs
-                    .get(url, session.as_deref())
-                    .await
-                    .with_context(|| format!("flaresolverr {ctx_label} {url}"))?;
-                if solution.status >= 400 {
-                    anyhow::bail!(
-                        "flaresolverr {ctx_label} HTTP {}: {}",
-                        solution.status,
-                        truncate_for_log(&solution.response, 200)
-                    );
+                // Two-shot loop: try a session, retry once on missing.
+                // Any other FS error bails on the first attempt.
+                for attempt in 0..2 {
+                    let session = self.acquire_session().await;
+                    match fs.get(url, session.as_deref()).await {
+                        Ok(solution) => {
+                            if solution.status >= 400 {
+                                anyhow::bail!(
+                                    "flaresolverr {ctx_label} HTTP {}: {}",
+                                    solution.status,
+                                    truncate_for_log(&solution.response, 200)
+                                );
+                            }
+                            self.absorb_fs_cookies(&solution);
+                            self.remember_fs_ua(&solution.user_agent).await;
+                            return Ok(solution.response);
+                        }
+                        Err(FsError::SessionMissing { session: gone }) if attempt == 0 => {
+                            tracing::info!(
+                                session = %gone,
+                                ctx = ctx_label,
+                                "FlareSolverr reported session missing; invalidating slot and retrying"
+                            );
+                            self.invalidate_session(&gone).await;
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(anyhow::Error::new(e))
+                                .with_context(|| format!("flaresolverr {ctx_label} {url}"));
+                        }
+                    }
                 }
-                self.absorb_fs_cookies(&solution);
-                self.remember_fs_ua(&solution.user_agent).await;
-                Ok(solution.response)
+                // Loop only exits via continue (one retry permitted) or
+                // an early return; reaching this line means we retried
+                // and hit SessionMissing twice in a row, which suggests
+                // FS itself is unhealthy.
+                anyhow::bail!(
+                    "flaresolverr {ctx_label} {url}: session missing twice in a row (FS may be unhealthy)"
+                );
             }
             None => {
                 let mut req = self.http.get(url);
