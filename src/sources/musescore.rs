@@ -1,5 +1,6 @@
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -36,6 +37,29 @@ const SEC_CH_UA: &str =
 const SEC_CH_UA_PLATFORM: &str = "\"Windows\"";
 
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Cadence for the background `cf_clearance` keep-warm re-solve. Cloudflare's
+/// cookie TTL is site-configured and opaque to us, but the common default is
+/// ~30 min; re-solving every 15 min mints a fresh cookie comfortably before a
+/// 30-min one lapses, so real user requests keep landing on the fast
+/// direct-replay path instead of a cold FlareSolverr solve.
+const KEEP_WARM_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// A search/fetch must have happened within this window for the keep-warm
+/// loop to bother re-solving. Bounds idle FlareSolverr usage: once traffic
+/// stops for this long we let the cookie lapse and the next user eats a
+/// single cold solve, rather than burning FS cycles on an idle instance.
+const KEEP_WARM_ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// Cheap, reliably CF-challenged URL used to mint/refresh `cf_clearance` out
+/// of band (startup warm-up and keep-warm loop).
+const WARM_URL: &str = "https://musescore.com/sheetmusic";
+
+/// Bounded concurrency for per-page CDN PNG downloads. The image CDN (unlike
+/// the rate-limited `/api/jmuse`) tolerates parallel fetches, so this cuts
+/// the download phase of a multi-page score roughly linearly while staying
+/// polite.
+const PNG_FETCH_CONCURRENCY: usize = 4;
 
 /// Per-request headers a real Chrome sends on a top-level navigation
 /// (typed URL / link click). Cloudflare's bot heuristics weight these
@@ -120,6 +144,10 @@ pub struct Musescore {
     /// headless-Chromium round-trip into a sub-second HTTP call.
     fs_ua: Mutex<Option<String>>,
     cached: Mutex<Option<CachedAlgorithm>>,
+    /// Unix timestamp (seconds) of the last user-driven search / PDF fetch,
+    /// or 0 if none yet. Read by the keep-warm loop to decide whether the
+    /// instance is active enough to justify a background re-solve.
+    last_activity: AtomicI64,
 }
 
 struct CachedAlgorithm {
@@ -181,7 +209,97 @@ impl Musescore {
             fs_session: Mutex::new(None),
             fs_ua: Mutex::new(None),
             cached: Mutex::new(None),
+            last_activity: AtomicI64::new(0),
         })
+    }
+
+    /// Spawn the out-of-band cookie warm-up tasks. No-op when FlareSolverr
+    /// isn't configured (direct fetches need no `cf_clearance` management).
+    /// Two tasks:
+    ///   * **startup warm-up** — one solve at boot so the *first* user request
+    ///     after a (re)deploy lands on the fast direct-replay path instead of
+    ///     paying a cold 30–60 s FlareSolverr solve. The in-memory cookie jar
+    ///     starts empty on every restart, so without this the first searcher
+    ///     always eats the cold cost.
+    ///   * **keep-warm loop** — while the source has seen recent traffic,
+    ///     re-solve every `KEEP_WARM_INTERVAL` to mint a fresh `cf_clearance`
+    ///     before the current one expires, holding the steady state on the
+    ///     fast path. Skips re-solving once the instance goes idle.
+    ///
+    /// Takes `Arc<Self>` so the detached tasks can outlive this call.
+    pub fn spawn_warm_tasks(self: Arc<Self>) {
+        if self.fs.is_none() {
+            return;
+        }
+
+        let startup = Arc::clone(&self);
+        tokio::spawn(async move {
+            match startup.force_warm().await {
+                Ok(()) => tracing::info!("MuseScore: cf_clearance warmed at startup"),
+                Err(e) => tracing::warn!(
+                    error = %format!("{:#}", e),
+                    "MuseScore startup warm-up failed; first request will solve on demand"
+                ),
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(KEEP_WARM_INTERVAL);
+            // Drop the immediate first tick — startup already warmed the cookie.
+            ticker.tick().await;
+            let active_window = KEEP_WARM_ACTIVE_WINDOW.as_secs() as i64;
+            loop {
+                ticker.tick().await;
+                let idle = self.seconds_since_activity();
+                if idle > active_window {
+                    tracing::debug!(idle_secs = idle, "MuseScore keep-warm: idle, skipping re-solve");
+                    continue;
+                }
+                match self.force_warm().await {
+                    Ok(()) => tracing::debug!("MuseScore keep-warm: cf_clearance refreshed"),
+                    Err(e) => tracing::warn!(
+                        error = %format!("{:#}", e),
+                        "MuseScore keep-warm re-solve failed"
+                    ),
+                }
+            }
+        });
+    }
+
+    /// Force a fresh `cf_clearance` by solving through FlareSolverr,
+    /// deliberately bypassing the direct-replay fast path (a still-valid but
+    /// aging cookie would otherwise short-circuit and never get refreshed).
+    /// Harvests the new cookie + UA into the shared jar exactly like a normal
+    /// challenged fetch. No-op when FlareSolverr isn't configured.
+    async fn force_warm(&self) -> anyhow::Result<()> {
+        let Some(fs) = self.fs.as_ref() else {
+            return Ok(());
+        };
+        let session = self.ensure_fs_session().await;
+        let solution = fs
+            .get(WARM_URL, session.as_deref())
+            .await
+            .context("flaresolverr warm-up solve")?;
+        anyhow::ensure!(
+            solution.status < 400,
+            "flaresolverr warm-up HTTP {}",
+            solution.status
+        );
+        self.absorb_fs_cookies(&solution);
+        self.remember_fs_ua(&solution.user_agent).await;
+        Ok(())
+    }
+
+    /// Record that a user-driven operation just ran, for the keep-warm loop.
+    fn mark_activity(&self) {
+        self.last_activity.store(now_unix(), Ordering::Relaxed);
+    }
+
+    /// Seconds since the last user-driven operation. Large when there's been
+    /// no traffic (or none since boot), which the keep-warm loop reads as
+    /// "idle, don't bother re-solving".
+    fn seconds_since_activity(&self) -> i64 {
+        now_unix().saturating_sub(self.last_activity.load(Ordering::Relaxed))
     }
 
     /// Return the FS session ID for `cmd: request.get`, creating it
@@ -408,20 +526,25 @@ impl Musescore {
         Ok((prepared_js, random_token))
     }
 
-    /// Mint the 4-character token for (score_id, type, index) by running the
-    /// rewritten bundle in Boa (pure-Rust JS engine — chosen over QuickJS to
-    /// keep the build toolchain-light: no C compiler needed on host or in
-    /// the bookworm Docker builder beyond what Cargo already provides). Boa
-    /// is synchronous, so we hop to a blocking thread to keep the tokio
-    /// runtime free.
-    async fn mint_token(
+    /// Mint the 4-character token for every page index `0..count` by running
+    /// the rewritten bundle in Boa (pure-Rust JS engine — chosen over QuickJS
+    /// to keep the build toolchain-light: no C compiler needed on host or in
+    /// the bookworm Docker builder beyond what Cargo already provides).
+    ///
+    /// All indices share a single Boa `Context` and a single eval of the
+    /// prepared bundle — the bundle is the expensive part to parse, and it's
+    /// page-independent, so re-evaluating it per page (as the old per-index
+    /// `mint_token` did) was pure waste on multi-page scores. Boa is
+    /// synchronous, so the whole batch runs on one blocking thread to keep
+    /// the tokio runtime free.
+    async fn mint_tokens(
         prepared_js: String,
         random_token: String,
         score_id: String,
         media_type: String,
-        index: usize,
-    ) -> anyhow::Result<String> {
-        tokio::task::spawn_blocking(move || -> anyhow::Result<String> {
+        count: usize,
+    ) -> anyhow::Result<Vec<String>> {
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
             use boa_engine::{js_string, Context, JsValue, Source};
 
             let mut ctx = Context::default();
@@ -448,21 +571,25 @@ impl Musescore {
                 .ok_or_else(|| anyhow::anyhow!("window.generateToken is not a function"))?
                 .clone();
 
-            // sandbox.js: md5(id + type + index + randomToken).substring(0, 4)
-            let input = format!("{score_id}{media_type}{index}{random_token}");
-            let arg = JsValue::from(js_string!(input.as_str()));
-            let result = generate_token_obj
-                .call(&JsValue::undefined(), &[arg], &mut ctx)
-                .map_err(|e| anyhow::anyhow!("generateToken call: {e}"))?;
-            let digest = result
-                .to_string(&mut ctx)
-                .map_err(|e| anyhow::anyhow!("digest to_string: {e}"))?
-                .to_std_string_lossy();
+            let mut tokens = Vec::with_capacity(count);
+            for index in 0..count {
+                // sandbox.js: md5(id + type + index + randomToken).substring(0, 4)
+                let input = format!("{score_id}{media_type}{index}{random_token}");
+                let arg = JsValue::from(js_string!(input.as_str()));
+                let result = generate_token_obj
+                    .call(&JsValue::undefined(), &[arg], &mut ctx)
+                    .map_err(|e| anyhow::anyhow!("generateToken call (index {index}): {e}"))?;
+                let digest = result
+                    .to_string(&mut ctx)
+                    .map_err(|e| anyhow::anyhow!("digest to_string (index {index}): {e}"))?
+                    .to_std_string_lossy();
 
-            if digest.len() < 4 {
-                anyhow::bail!("generateToken returned short digest {digest:?}");
+                if digest.len() < 4 {
+                    anyhow::bail!("generateToken returned short digest {digest:?} for index {index}");
+                }
+                tokens.push(digest[..4].to_string());
             }
-            Ok(digest[..4].to_string())
+            Ok(tokens)
         })
         .await
         .context("token-mint task join")?
@@ -554,6 +681,7 @@ impl Source for Musescore {
         filters: &SearchFilters,
         limit: usize,
     ) -> anyhow::Result<Vec<SearchResult>> {
+        self.mark_activity();
         // MuseScore's /sheetmusic search page accepts an `instrument` slug
         // param. Slugs line up with our Instrument::slug() values for the
         // common cases; for ones MuseScore doesn't recognise the param is
@@ -683,6 +811,7 @@ impl Source for Musescore {
     }
 
     async fn fetch_pdf_bytes(&self, id: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+        self.mark_activity();
         let (bundle_url, meta) = self.fetch_score_page(id).await?;
         let pages_count = meta.pages_count.unwrap_or(1).max(1);
         anyhow::ensure!(pages_count <= 200, "musescore score has implausible pages_count={pages_count}");
@@ -690,41 +819,53 @@ impl Source for Musescore {
 
         let (prepared_js, random_token) = self.prepare_algorithm(&bundle_url).await?;
 
-        // Mint tokens + resolve per-page CDN URLs in series. Parallelizing
-        // here is tempting but musescore's per-IP rate limit on `/api/jmuse`
-        // is hair-trigger; serial keeps the failure modes predictable.
+        // Mint every page's token in one shot (single Boa context + one bundle
+        // eval), then resolve CDN URLs via `/api/jmuse` *serially*. The jmuse
+        // resolve stays serial because musescore's per-IP rate limit on that
+        // endpoint is hair-trigger; the token minting was the part worth
+        // batching.
+        let tokens = Self::mint_tokens(
+            prepared_js,
+            random_token,
+            id.to_string(),
+            "img".to_string(),
+            pages_count,
+        )
+        .await
+        .context("minting page tokens")?;
+
         let mut png_urls = Vec::with_capacity(pages_count);
-        for index in 0..pages_count {
-            let token = Self::mint_token(
-                prepared_js.clone(),
-                random_token.clone(),
-                id.to_string(),
-                "img".to_string(),
-                index,
-            )
-            .await
-            .with_context(|| format!("minting token for page {index}"))?;
+        for (index, token) in tokens.iter().enumerate() {
             let url = self
-                .jmuse_url(&token, &referer, id, "img", index)
+                .jmuse_url(token, &referer, id, "img", index)
                 .await
                 .with_context(|| format!("resolving CDN url for page {index}"))?;
             png_urls.push(url);
         }
 
-        // Reserve a budget for the assembled PDF; each PNG roughly fits in
-        // its own slice of max_bytes. We let printpdf decide actual encoding
-        // and only enforce the cap on the final output.
+        // Download the page PNGs from the CDN with bounded concurrency. Unlike
+        // `/api/jmuse`, the image CDN isn't rate-limited, so parallel fetches
+        // are safe and cut multi-page latency. We fan out in chunks of
+        // `PNG_FETCH_CONCURRENCY` (each chunk joined before the next starts);
+        // page order is preserved because `join_all` returns results in input
+        // order. Each PNG gets the full `max_bytes` budget; the aggregate cap
+        // is enforced as the chunks land.
         let per_page_budget = max_bytes;
         let mut pngs: Vec<Vec<u8>> = Vec::with_capacity(pages_count);
         let mut running = 0usize;
-        for url in &png_urls {
-            let bytes = self.fetch_bytes(url, per_page_budget).await?;
-            running = running.saturating_add(bytes.len());
-            anyhow::ensure!(
-                running <= max_bytes,
-                "musescore PNGs aggregate exceeds {max_bytes} bytes"
-            );
-            pngs.push(bytes);
+        for chunk in png_urls.chunks(PNG_FETCH_CONCURRENCY) {
+            let fetches = chunk
+                .iter()
+                .map(|url| self.fetch_bytes(url, per_page_budget));
+            for bytes in futures_util::future::join_all(fetches).await {
+                let bytes = bytes?;
+                running = running.saturating_add(bytes.len());
+                anyhow::ensure!(
+                    running <= max_bytes,
+                    "musescore PNGs aggregate exceeds {max_bytes} bytes"
+                );
+                pngs.push(bytes);
+            }
         }
 
         let pdf_bytes = tokio::task::spawn_blocking(move || assemble_pdf(&pngs))
@@ -794,6 +935,16 @@ struct SearchScore {
 /// check to recognise a stale cookie and fall back to FlareSolverr.
 fn looks_like_cf_challenge(html: &str) -> bool {
     html.contains("Just a moment") || html.contains("Attention Required")
+}
+
+/// Current Unix time in whole seconds. Clamps a pre-epoch clock to 0 rather
+/// than panicking; only feeds the keep-warm idle heuristic, so a coarse
+/// value is fine.
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Look for the JS bundle URL that matches the upstream extension's regex:

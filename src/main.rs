@@ -40,12 +40,16 @@ async fn main() -> anyhow::Result<()> {
 
     let imslp = sources::imslp::Imslp::new()?;
     let mutopia = sources::mutopia::Mutopia::new()?;
-    let musescore = sources::musescore::Musescore::new()?;
+    let musescore = Arc::new(sources::musescore::Musescore::new()?);
+    // Warm (and keep warm) the Cloudflare `cf_clearance` cookie out of band so
+    // user requests land on the fast direct-replay path instead of a cold
+    // FlareSolverr solve. No-op when FLARESOLVERR_URL is unset.
+    Arc::clone(&musescore).spawn_warm_tasks();
     let ultimate_guitar = sources::ultimate_guitar::UltimateGuitar::new()?;
     let sources: Vec<Arc<dyn sources::Source>> = vec![
         Arc::new(imslp),
         Arc::new(mutopia),
-        Arc::new(musescore),
+        musescore,
         Arc::new(ultimate_guitar),
     ];
     let source_ids: Vec<&'static str> = sources.iter().map(|s| s.id()).collect();
