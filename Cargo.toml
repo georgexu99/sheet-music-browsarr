@@ -57,11 +57,12 @@ moka = { version = "0.12", features = ["future"] }
 # pipeline then kicks in normally.
 strsim = "0.11"
 
-# JS runtime for MuseScore token minting. Pure-Rust to keep the build
-# toolchain-light (no C compiler needed on host or in CI/Docker beyond what
-# Cargo already pulls in). Boa is slower than QuickJS but token minting
-# happens once per download and runs on a blocking thread anyway.
-boa_engine = { version = "0.21", default-features = false }
+# MD5 for MuseScore jmuse token minting. The per-page auth token is just
+# `md5(id + type + index + salt)` truncated to 4 hex chars (verified against
+# the musescore-downloader / yt-dlp implementations), so we compute it
+# natively instead of running MuseScore's ever-changing JS bundle through a
+# JS engine — faster, and immune to their bundle syntax churn.
+md-5 = "0.10"
 
 # PDF assembly for MuseScore: musescore.com only serves per-page PNGs on
 # free user uploads (no server-side PDF), so we stitch them ourselves.

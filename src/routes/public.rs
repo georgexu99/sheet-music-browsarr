@@ -955,10 +955,13 @@ async fn pdf_handler(
             (out, bytes).into_response()
         }
         Err(e) => {
+            // `{:#}` flattens the full anyhow chain onto one line so the
+            // underlying cause (e.g. the exact bundle/jmuse failure) is
+            // visible, not just the outermost context.
             tracing::warn!(
                 source = %source_id,
                 id = %id,
-                error = %e,
+                error = %format!("{:#}", e),
                 "fetch_pdf_bytes failed; falling back to external_url"
             );
             health::record_err(&state.source_health, source.id(), &e.to_string());

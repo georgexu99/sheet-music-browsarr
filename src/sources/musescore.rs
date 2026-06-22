@@ -113,22 +113,21 @@ fn nav_headers() -> [(HeaderName, HeaderValue); 6] {
 /// MuseScore.com — community-uploaded sheet music. The site does not expose
 /// a server-side PDF for user uploads (`is_pdf == 0` for ~all free scores);
 /// instead it serves per-page PNG renderings through an authenticated API
-/// (`/api/jmuse`) that requires a short-lived MD5 token derived from a salt
-/// that's embedded in their webpack bundle. We port the technique from the
-/// `musescore-downloader` browser extension:
+/// (`/api/jmuse`) that requires a short-lived token: the first 4 hex chars of
+/// `md5(id + type + index + salt)`, where `salt` is a short string embedded
+/// in their webpack bundle. We port the technique from the
+/// `musescore-downloader` browser extension / yt-dlp:
 ///
 ///   1. Fetch a score page and extract the bundle URL from a `<link>` tag.
-///   2. Download the bundle (~0.5 MB minified JS).
-///   3. Locate the MD5 module (contains `_digestsize` + `_blocksize`) and
-///      surgically rewrite it into a callable `window.generateToken` MD5
-///      function, executed in QuickJS to mint per-request tokens.
-///   4. For each page index 0..pages_count, mint a token, call jmuse for the
-///      `type=img` CDN URL, GET the PNG.
-///   5. Stitch PNGs into a single PDF (printpdf) and return the bytes.
+///   2. Download the bundle (~0.5 MB minified JS) and extract the `salt`
+///      string literal (the one fed into `md5(…).substr(0, 4)`).
+///   3. For each page index 0..pages_count, compute the MD5 token natively
+///      (no JS engine), call jmuse for the `type=img` CDN URL, GET the PNG.
+///   4. Stitch PNGs into a single PDF (printpdf) and return the bytes.
 ///
-/// The prepared script is cached by bundle URL; bundle URLs change on every
-/// MuseScore deploy (the path embeds a content hash), so a single cache
-/// entry is sufficient — when MuseScore deploys, we re-prepare once.
+/// The salt is cached by bundle URL; bundle URLs change on every MuseScore
+/// deploy (the path embeds a content hash), so a single cache entry is
+/// sufficient — when MuseScore deploys, we re-extract the salt once.
 pub struct Musescore {
     http: Client,
     /// Shared cookie jar — anything Cloudflare hands us (`cf_clearance`,
@@ -187,7 +186,8 @@ pub struct Musescore {
 
 struct CachedAlgorithm {
     bundle_url: String,
-    prepared_js: String,
+    /// The `salt` string MuseScore concatenates into the jmuse MD5 token.
+    /// Changes per deploy; re-extracted when the bundle URL changes.
     random_token: String,
 }
 
@@ -701,14 +701,15 @@ impl Musescore {
         Ok((bundle_url, meta))
     }
 
-    /// Returns a prepared JS bundle and the extracted `randomToken` salt,
-    /// reusing the cache if the bundle URL hasn't changed.
-    async fn prepare_algorithm(&self, bundle_url: &str) -> anyhow::Result<(String, String)> {
+    /// Fetch the page's JS bundle and extract the `salt` MuseScore
+    /// concatenates into the per-page jmuse MD5 token, reusing the cache if
+    /// the bundle URL hasn't changed.
+    async fn prepare_algorithm(&self, bundle_url: &str) -> anyhow::Result<String> {
         {
             let guard = self.cached.lock().await;
             if let Some(cached) = guard.as_ref() {
                 if cached.bundle_url == bundle_url {
-                    return Ok((cached.prepared_js.clone(), cached.random_token.clone()));
+                    return Ok(cached.random_token.clone());
                 }
             }
         }
@@ -725,85 +726,15 @@ impl Musescore {
             .await
             .context("musescore bundle body")?;
 
-        let (prepared_js, random_token) = rewrite_bundle(&bundle)
-            .context("rewriting musescore bundle into callable token algorithm")?;
+        let random_token = find_random_token(&bundle)
+            .ok_or_else(|| anyhow::anyhow!("randomToken salt not found in musescore bundle"))?;
 
         let mut guard = self.cached.lock().await;
         *guard = Some(CachedAlgorithm {
             bundle_url: bundle_url.to_string(),
-            prepared_js: prepared_js.clone(),
             random_token: random_token.clone(),
         });
-        Ok((prepared_js, random_token))
-    }
-
-    /// Mint the 4-character token for every page index `0..count` by running
-    /// the rewritten bundle in Boa (pure-Rust JS engine — chosen over QuickJS
-    /// to keep the build toolchain-light: no C compiler needed on host or in
-    /// the bookworm Docker builder beyond what Cargo already provides).
-    ///
-    /// All indices share a single Boa `Context` and a single eval of the
-    /// prepared bundle — the bundle is the expensive part to parse, and it's
-    /// page-independent, so re-evaluating it per page (as the old per-index
-    /// `mint_token` did) was pure waste on multi-page scores. Boa is
-    /// synchronous, so the whole batch runs on one blocking thread to keep
-    /// the tokio runtime free.
-    async fn mint_tokens(
-        prepared_js: String,
-        random_token: String,
-        score_id: String,
-        media_type: String,
-        count: usize,
-    ) -> anyhow::Result<Vec<String>> {
-        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
-            use boa_engine::{js_string, Context, JsValue, Source};
-
-            let mut ctx = Context::default();
-
-            // The rewritten bundle expects a top-level `window` global.
-            ctx.eval(Source::from_bytes("var window = {};"))
-                .map_err(|e| anyhow::anyhow!("eval window stub: {e}"))?;
-            ctx.eval(Source::from_bytes(prepared_js.as_bytes()))
-                .map_err(|e| anyhow::anyhow!("eval prepared bundle: {e}"))?;
-
-            let window = ctx
-                .global_object()
-                .get(js_string!("window"), &mut ctx)
-                .map_err(|e| anyhow::anyhow!("get window: {e}"))?;
-            let window_obj = window
-                .as_object()
-                .ok_or_else(|| anyhow::anyhow!("window is not an object"))?
-                .clone();
-            let generate_token_val = window_obj
-                .get(js_string!("generateToken"), &mut ctx)
-                .map_err(|e| anyhow::anyhow!("window.generateToken missing: {e}"))?;
-            let generate_token_obj = generate_token_val
-                .as_object()
-                .ok_or_else(|| anyhow::anyhow!("window.generateToken is not a function"))?
-                .clone();
-
-            let mut tokens = Vec::with_capacity(count);
-            for index in 0..count {
-                // sandbox.js: md5(id + type + index + randomToken).substring(0, 4)
-                let input = format!("{score_id}{media_type}{index}{random_token}");
-                let arg = JsValue::from(js_string!(input.as_str()));
-                let result = generate_token_obj
-                    .call(&JsValue::undefined(), &[arg], &mut ctx)
-                    .map_err(|e| anyhow::anyhow!("generateToken call (index {index}): {e}"))?;
-                let digest = result
-                    .to_string(&mut ctx)
-                    .map_err(|e| anyhow::anyhow!("digest to_string (index {index}): {e}"))?
-                    .to_std_string_lossy();
-
-                if digest.len() < 4 {
-                    anyhow::bail!("generateToken returned short digest {digest:?} for index {index}");
-                }
-                tokens.push(digest[..4].to_string());
-            }
-            Ok(tokens)
-        })
-        .await
-        .context("token-mint task join")?
+        Ok(random_token)
     }
 
     /// Hit `/api/jmuse` for a single (id, type, index) tuple and return the
@@ -1028,22 +959,12 @@ impl Source for Musescore {
         anyhow::ensure!(pages_count <= 200, "musescore score has implausible pages_count={pages_count}");
         let referer = self.external_url(id);
 
-        let (prepared_js, random_token) = self.prepare_algorithm(&bundle_url).await?;
+        let salt = self.prepare_algorithm(&bundle_url).await?;
 
-        // Mint every page's token in one shot (single Boa context + one bundle
-        // eval), then resolve CDN URLs via `/api/jmuse` *serially*. The jmuse
-        // resolve stays serial because musescore's per-IP rate limit on that
-        // endpoint is hair-trigger; the token minting was the part worth
-        // batching.
-        let tokens = Self::mint_tokens(
-            prepared_js,
-            random_token,
-            id.to_string(),
-            "img".to_string(),
-            pages_count,
-        )
-        .await
-        .context("minting page tokens")?;
+        // Mint every page's token natively (cheap MD5), then resolve CDN URLs
+        // via `/api/jmuse` *serially*. The jmuse resolve stays serial because
+        // musescore's per-IP rate limit on that endpoint is hair-trigger.
+        let tokens = mint_tokens(&salt, id, "img", pages_count);
 
         let mut png_urls = Vec::with_capacity(pages_count);
         for (index, token) in tokens.iter().enumerate() {
@@ -1213,30 +1134,10 @@ fn matches_bundle_pattern(url: &str) -> bool {
         && hash.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// Apply the three regex-style substitutions from the upstream extension to
-/// turn the minified bundle into a self-contained script that defines
-/// `window.generateToken`. Also returns the embedded `randomToken` salt.
-fn rewrite_bundle(bundle: &str) -> anyhow::Result<(String, String)> {
-    // 1. Extract the randomToken salt — the literal string that the bundle
-    //    later passes through `.substr(0, 4)`. Regex: `"([\W\w]{1,50})"\)\.substr\(0, *4\)`
-    let random_token = find_random_token(bundle)
-        .ok_or_else(|| anyhow::anyhow!("randomToken salt not found in bundle"))?;
-
-    // 2. Locate the webpack module id whose body contains both `_digestsize`
-    //    and `_blocksize` (the MD5 module). The id appears immediately
-    //    before its definition: `, <id>: function(...){` or `, <id>: (...) => {`.
-    let function_number = find_md5_module_id(bundle)
-        .ok_or_else(|| anyhow::anyhow!("MD5 module not found in bundle"))?;
-
-    // 3. Apply the three textual substitutions.
-    let script_start = build_script_start(&function_number);
-    let mut script = replace_webpack_header(bundle, &script_start)?;
-    script = replace_closing_paren(&script)?;
-    script = replace_exports_with_window(&script)?;
-
-    Ok((script, random_token))
-}
-
+/// Extract the `salt` string MuseScore feeds into the per-page jmuse token
+/// (`md5(id + type + index + salt).substr(0, 4)`). We find the string literal
+/// that immediately precedes `).substr(0, 4)` in the bundle.
+///
 /// Port of: `script.match(/"([\W\w]{1,50})"\)\.substr\(0, *4\)/)?.[1]`
 fn find_random_token(s: &str) -> Option<String> {
     let mut start = 0;
@@ -1270,154 +1171,6 @@ fn substr_zero_four_follows(after: &str) -> bool {
     };
     let rest = rest.trim_start();
     rest.starts_with('4')
-}
-
-/// Port of:
-///   script.split(/, *(\d+): *(?:function)*\([\w,]{1,8}\)(?: *=> *|)\{/)
-///   ...find part containing both `_digestsize` and `_blocksize` and return
-///   the preceding capture group.
-///
-/// We don't actually port the regex — we scan for `_digestsize=`, then walk
-/// backwards to the nearest `, <digits>: function(` (or `: (` arrow form).
-fn find_md5_module_id(s: &str) -> Option<String> {
-    let dig = s.find("_digestsize")?;
-    // From `dig`, walk back to find the enclosing module header `, NNN: function` or `, NNN: (`.
-    let prefix = &s[..dig];
-    // Limit search to the last few KB to keep things cheap.
-    let window_start = prefix.len().saturating_sub(50_000);
-    let window = &prefix[window_start..];
-    // Find the last `, <digits>: function(` or `, <digits>: (`.
-    let mut found_id: Option<String> = None;
-    let mut search_from = 0;
-    while let Some(comma_off) = window[search_from..].find(',') {
-        let abs = search_from + comma_off;
-        // Try to parse `, *(\d+) *: *(?:function)?\(`
-        let after = &window[abs + 1..];
-        let after_trimmed = after.trim_start_matches(' ');
-        let digits_end = after_trimmed
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after_trimmed.len());
-        if digits_end > 0 {
-            let digits = &after_trimmed[..digits_end];
-            let rest = &after_trimmed[digits_end..];
-            let rest = rest.trim_start_matches(' ');
-            if let Some(rest) = rest.strip_prefix(':') {
-                let rest = rest.trim_start_matches(' ');
-                // function(...) or (...)=>{ ... }
-                let is_module_header = rest.starts_with("function(")
-                    || rest.starts_with("function (")
-                    || rest.starts_with('(');
-                if is_module_header {
-                    found_id = Some(digits.to_string());
-                }
-            }
-        }
-        search_from = abs + 1;
-    }
-    found_id
-}
-
-fn build_script_start(function_number: &str) -> String {
-    format!(
-        r#"(function (modules) {{
-  var installedModules = {{}};
-  function __webpack_require__(moduleId) {{
-    if (installedModules[moduleId]) {{ return installedModules[moduleId].exports; }}
-    var module = installedModules[moduleId] = {{ i: moduleId, l: false, exports: {{}} }};
-    modules[moduleId].call(module.exports, module, module.exports, __webpack_require__);
-    module.l = true;
-    return module.exports;
-  }}
-  __webpack_require__.m = modules;
-  __webpack_require__.c = installedModules;
-  return __webpack_require__(__webpack_require__.s = {function_number});
-}})("#
-    )
-}
-
-/// Port of: `script.replace(/\(self\.[^}]*(?=\{(\d+):)/, getScriptStart(...))`
-/// — find `(self.` followed by chars up to a `{<digits>:`, replace that span.
-fn replace_webpack_header(s: &str, replacement: &str) -> anyhow::Result<String> {
-    let start = s
-        .find("(self.")
-        .ok_or_else(|| anyhow::anyhow!("webpack header `(self.` not found"))?;
-    // Find first `{<digits>:` after start.
-    let from = start + "(self.".len();
-    let tail = &s[from..];
-    let mut pos = 0;
-    let end_rel = loop {
-        let Some(brace_off) = tail[pos..].find('{') else {
-            anyhow::bail!("no `{{N:` brace after (self.)");
-        };
-        let brace_abs = pos + brace_off;
-        let after = &tail[brace_abs + 1..];
-        let digits_end = after
-            .find(|c: char| !c.is_ascii_digit())
-            .unwrap_or(after.len());
-        if digits_end > 0 && after.as_bytes().get(digits_end) == Some(&b':') {
-            break brace_abs;
-        }
-        pos = brace_abs + 1;
-    };
-    let end = from + end_rel;
-    // Also need to honor the `[^}]*` constraint: the captured span must not
-    // include a `}` between `(self.` and the brace.
-    if s[start..end].contains('}') {
-        anyhow::bail!("webpack header span unexpectedly contains a closing brace");
-    }
-    let mut out = String::with_capacity(s.len() + replacement.len());
-    out.push_str(&s[..start]);
-    out.push_str(replacement);
-    out.push_str(&s[end..]);
-    Ok(out)
-}
-
-/// Port of: `script.replace(/}}]\)/, '}})')`
-fn replace_closing_paren(s: &str) -> anyhow::Result<String> {
-    let needle = "}}])";
-    let pos = s
-        .find(needle)
-        .ok_or_else(|| anyhow::anyhow!("closing `}}}}])` not found"))?;
-    let mut out = String::with_capacity(s.len());
-    out.push_str(&s[..pos]);
-    out.push_str("}})");
-    out.push_str(&s[pos + needle.len()..]);
-    Ok(out)
-}
-
-/// Port of:
-///   `script.replace(/_digestsize=(\d+),\w+\.exports=function\(/,
-///     (m, a) => `_digestsize=${a},window.generateToken=function(`)`
-fn replace_exports_with_window(s: &str) -> anyhow::Result<String> {
-    // Find `_digestsize=` then `<digits>,<word>.exports=function(`.
-    let dig_start = s
-        .find("_digestsize=")
-        .ok_or_else(|| anyhow::anyhow!("_digestsize= not found"))?;
-    let after = &s[dig_start + "_digestsize=".len()..];
-    let digits_end = after
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| anyhow::anyhow!("_digestsize= has no digits"))?;
-    let digits = &after[..digits_end];
-    let rest = &after[digits_end..];
-    let rest = rest
-        .strip_prefix(',')
-        .ok_or_else(|| anyhow::anyhow!("expected `,` after digestsize digits"))?;
-    let word_end = rest
-        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
-        .unwrap_or(rest.len());
-    let suffix = &rest[word_end..];
-    let suffix = suffix
-        .strip_prefix(".exports=function(")
-        .ok_or_else(|| anyhow::anyhow!("expected `<word>.exports=function(` after digestsize"))?;
-    // Reassemble.
-    let head = &s[..dig_start];
-    let tail = suffix;
-    let replacement = format!("_digestsize={digits},window.generateToken=function(");
-    let mut out = String::with_capacity(s.len() + replacement.len());
-    out.push_str(head);
-    out.push_str(&replacement);
-    out.push_str(tail);
-    Ok(out)
 }
 
 /// Locate and parse the SSR hydration JSON inside the score page or search
@@ -1782,6 +1535,25 @@ fn strip_highlight_markers(s: &str) -> String {
     s.replace("[b]", "").replace("[/b]", "")
 }
 
+/// Mint the 4-character jmuse auth token for every page index `0..count`.
+/// The token is the first 4 hex chars of `md5(id + type + index + salt)` —
+/// MuseScore's bundle computes exactly this, as confirmed by the
+/// musescore-downloader / yt-dlp / amuse implementations. We compute it
+/// natively instead of running their (frequently-changing, minified) JS
+/// bundle through a JS engine: faster, and immune to bundle syntax churn
+/// that used to break token minting on every MuseScore deploy.
+fn mint_tokens(salt: &str, score_id: &str, media_type: &str, count: usize) -> Vec<String> {
+    use md5::{Digest, Md5};
+    (0..count)
+        .map(|index| {
+            let input = format!("{score_id}{media_type}{index}{salt}");
+            let digest = Md5::digest(input.as_bytes());
+            // First 4 hex chars of the digest == first 2 bytes as lowercase hex.
+            format!("{:02x}{:02x}", digest[0], digest[1])
+        })
+        .collect()
+}
+
 /// Stitch a Vec of PNG byte buffers into a single PDF document, one page
 /// per image. Page size is derived from the PNG dimensions at 96 DPI so the
 /// page proportions match the rendered score.
@@ -1833,6 +1605,27 @@ mod tests {
     }
 
     #[test]
+    fn mint_tokens_native_md5() {
+        // Token = first 4 hex chars of md5(score_id + type + index + salt),
+        // lowercase. With all-empty score_id/type/salt the per-index input is
+        // just the index digit, so we can pin against well-known MD5 vectors:
+        //   md5("0") = cfcd208495d565ef66e7dff9f98764da
+        //   md5("1") = c4ca4238a0b923820dcc509a6f75849b
+        let tokens = mint_tokens("", "", "", 2);
+        assert_eq!(tokens, vec!["cfcd".to_string(), "c4ca".to_string()]);
+
+        // Shape check for a realistic call: salt="xy", score_id="img",
+        // media_type="42" → index 0 hashes "img420xy". Just assert the token
+        // is 4 lowercase hex chars (the exact value isn't a known vector).
+        let one = mint_tokens("xy", "img", "42", 1);
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].len(), 4);
+        assert!(one[0]
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
     fn strip_markers() {
         assert_eq!(
             strip_highlight_markers("[b]Fur[/b] [b]Elise[/b]"),
@@ -1862,21 +1655,18 @@ mod tests {
     //
     // `#[ignore]` so it never runs as part of `cargo test`. Exercises the
     // whole MuseScore pipeline against the live site:
-    //   search → score page → bundle fetch → rewrite_bundle → Boa →
+    //   search → score page → bundle fetch → salt extraction → native MD5 →
     //   /api/jmuse → per-page PNGs → printpdf assembly.
     //
-    // Designed for the CI Linux runner; the Windows dev host can't link
-    // boa_engine without gcc. Run manually with:
+    // Run manually with:
     //
     //     cargo test musescore_smoke -- --ignored --nocapture
     //
-    // Failure modes guide where the rewriter / pipeline is broken:
+    // Failure modes guide where the pipeline is broken:
     //   * "musescore search HTTP …" — Phase B headers needed
-    //   * "could not find musescore bundle URL …" — Phase E rewriter
-    //   * "MD5 module not found in bundle" — Phase E (find_md5_module_id)
-    //   * "randomToken salt not found in bundle" — Phase E (find_random_token)
-    //   * "generateToken call: …" / "window.generateToken missing" — Phase E (Boa eval)
-    //   * "musescore jmuse error: …" — token mint wrong, or MuseScore Pro content
+    //   * "could not find musescore bundle URL …" — bundle URL extraction
+    //   * "randomToken salt not found in musescore bundle" — find_random_token
+    //   * "musescore jmuse error: …" — salt/token wrong, or MuseScore Pro content
     //   * "bytes don't start with %PDF-1." — printpdf re-encode regression
     //
     // Override the score id via MUSESCORE_SMOKE_QUERY / MUSESCORE_SMOKE_ID
