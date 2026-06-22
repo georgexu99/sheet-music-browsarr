@@ -748,19 +748,33 @@ impl Musescore {
         index: usize,
     ) -> anyhow::Result<String> {
         let url = format!("https://musescore.com/api/jmuse?id={id}&index={index}&type={media_type}");
-        let resp: JmuseResponse = self
+        let http_resp = self
             .http
             .get(&url)
             .header(reqwest::header::AUTHORIZATION, token)
             .header(reqwest::header::REFERER, referer)
             .send()
             .await
-            .context("musescore jmuse request")?
-            .error_for_status()
-            .context("musescore jmuse status")?
-            .json()
+            .context("musescore jmuse request")?;
+
+        // Read the body before raising on non-2xx. MuseScore returns a JSON
+        // explanation on 401/403/404 (bad token vs. Pro-gated page vs. index
+        // out of range); `error_for_status()` would discard it, leaving a bare
+        // status that can't tell those apart. A page index past the free
+        // preview on a paid score 404s here — distinguishable only by the body.
+        let status = http_resp.status();
+        let body = http_resp
+            .text()
             .await
-            .context("musescore jmuse json")?;
+            .context("musescore jmuse body")?;
+        if !status.is_success() {
+            let snippet: String = body.chars().take(400).collect();
+            anyhow::bail!(
+                "musescore jmuse non-success status={status} index={index} type={media_type} body={snippet:?}"
+            );
+        }
+        let resp: JmuseResponse =
+            serde_json::from_str(&body).context("musescore jmuse json")?;
 
         if resp.result != "success" {
             anyhow::bail!("musescore jmuse error: {:?}", resp.error);
@@ -960,6 +974,16 @@ impl Source for Musescore {
         let referer = self.external_url(id);
 
         let salt = self.prepare_algorithm(&bundle_url).await?;
+        // One line that pins the download attempt: how many pages we're about
+        // to request and that a salt was extracted. If page 0 resolves but a
+        // later index 404s, this number vs. the failing index says whether
+        // we over-counted pages or hit a paywalled page.
+        tracing::info!(
+            id,
+            pages_count,
+            salt_len = salt.len(),
+            "musescore: resolving page images"
+        );
 
         // Mint every page's token natively (cheap MD5), then resolve CDN URLs
         // via `/api/jmuse` *serially*. The jmuse resolve stays serial because
