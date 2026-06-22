@@ -38,6 +38,19 @@ async fn main() -> anyhow::Result<()> {
         .with_secure(cfg.secure_cookies)
         .with_expiry(Expiry::OnInactivity(time::Duration::days(30)));
 
+    // Reclaim any FlareSolverr sessions stranded by a previous instance
+    // before the sources spin up their own. A redeploy restarts this
+    // container but not FlareSolverr, so the prior instance's
+    // `musescore-*` / `ultimateguitar` sessions (and their Chromium) leak;
+    // worse, the new instance's `sessions.create` then collides with the
+    // stale same-named session, fails, and silently degrades to sessionless
+    // mode — which spawns even more browsers. Purging first makes the
+    // subsequent pre-warm creates clean. No-op when FLARESOLVERR_URL is unset.
+    if let Some(fs) = sources::flaresolverr::FlareSolverr::from_env()? {
+        let reaped = fs.purge_all_sessions().await;
+        tracing::info!(reaped, "flaresolverr: startup session purge complete");
+    }
+
     let imslp = sources::imslp::Imslp::new()?;
     let mutopia = sources::mutopia::Mutopia::new()?;
     // MuseScore is held as a concrete Arc<Musescore> (not erased to
@@ -97,6 +110,52 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%addr, "sheet-music-browsarr listening");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+
+    // Drained on SIGTERM (Docker stop / Portainer redeploy) or Ctrl-C.
+    // Destroy our FlareSolverr sessions so we don't strand their Chromium
+    // for the next instance to inherit. Best-effort, time-boxed so a wedged
+    // FS can't hold the process open past the container's stop grace period.
+    if let Some(fs) = sources::flaresolverr::FlareSolverr::from_env()? {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), fs.purge_all_sessions())
+            .await
+        {
+            Ok(reaped) => tracing::info!(reaped, "flaresolverr: shutdown session purge complete"),
+            Err(_) => tracing::warn!("flaresolverr: shutdown session purge timed out"),
+        }
+    }
     Ok(())
+}
+
+/// Resolves when the process should begin a graceful shutdown: SIGTERM
+/// (how Docker/Portainer stop a container) or Ctrl-C for local runs.
+async fn shutdown_signal() {
+    use tokio::signal;
+
+    let ctrl_c = async {
+        if let Err(e) = signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to install Ctrl-C handler");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => tracing::error!(error = %e, "failed to install SIGTERM handler"),
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("shutdown signal received; draining connections");
 }

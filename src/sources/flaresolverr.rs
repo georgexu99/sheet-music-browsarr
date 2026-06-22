@@ -39,6 +39,11 @@ const FS_TIMEOUT: Duration = Duration::from_secs(45);
 /// mode is a single clean error rather than a layered double-timeout.
 const FS_MAX_TIMEOUT_MS: u64 = 45_000;
 
+/// Env var naming the FlareSolverr base URL (e.g. `http://10.0.0.91:8191`).
+/// Every CF-challenged source opts in through this one var; the
+/// startup/shutdown session purge reads it too.
+pub const URL_ENV: &str = "FLARESOLVERR_URL";
+
 #[derive(Clone)]
 pub struct FlareSolverr {
     http: Client,
@@ -117,6 +122,22 @@ struct FsSessionCmd<'a> {
     session: &'a str,
 }
 
+/// Request body for commands that take no arguments (`sessions.list`).
+#[derive(Serialize)]
+struct FsBareCmd<'a> {
+    cmd: &'a str,
+}
+
+/// Response shape for `sessions.list`: the live session IDs.
+#[derive(Debug, Deserialize)]
+struct FsSessionsList {
+    status: String,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    sessions: Vec<String>,
+}
+
 /// Typed error for FlareSolverr `request.get` calls. The caller cares
 /// about two cases: (a) the session it referenced no longer exists
 /// (FS restarted, nightly refresh destroyed it, or a session leaked
@@ -175,6 +196,17 @@ impl FlareSolverr {
         let http = Client::builder().timeout(FS_TIMEOUT).build()?;
         let base_url = base_url.trim_end_matches('/').to_string();
         Ok(Self { http, base_url })
+    }
+
+    /// Construct from `FLARESOLVERR_URL`, or `None` when it's unset/empty —
+    /// mirroring the opt-in each source applies. Used by the startup and
+    /// shutdown session purge in `main`, which need an FS client independent
+    /// of any particular source.
+    pub fn from_env() -> anyhow::Result<Option<Self>> {
+        match std::env::var(URL_ENV).ok().filter(|s| !s.is_empty()) {
+            Some(url) => Ok(Some(Self::new(url)?)),
+            None => Ok(None),
+        }
     }
 
     /// Create a persistent FlareSolverr session. The session keeps a
@@ -254,6 +286,65 @@ impl FlareSolverr {
         );
     }
 
+    /// List the IDs of all sessions FlareSolverr currently holds open. Each
+    /// session is a live Chromium browser context, so this is effectively
+    /// "what browsers are alive right now".
+    pub async fn list_sessions(&self) -> anyhow::Result<Vec<String>> {
+        let endpoint = format!("{}/v1", self.base_url);
+        let env: FsSessionsList = self
+            .http
+            .post(&endpoint)
+            .json(&FsBareCmd {
+                cmd: "sessions.list",
+            })
+            .send()
+            .await
+            .context("flaresolverr sessions.list request")?
+            .error_for_status()
+            .context("flaresolverr sessions.list HTTP status")?
+            .json()
+            .await
+            .context("flaresolverr sessions.list json")?;
+        if env.status != "ok" {
+            anyhow::bail!(
+                "flaresolverr sessions.list status={} message={:?}",
+                env.status,
+                env.message
+            );
+        }
+        Ok(env.sessions)
+    }
+
+    /// Destroy every session FlareSolverr currently holds, returning how many
+    /// were reaped. Best-effort: a failure to list or to destroy an
+    /// individual session is logged, not propagated, so a wedged FS can't
+    /// block startup or shutdown.
+    ///
+    /// Called at boot to reclaim browsers stranded by a previous instance
+    /// (a redeploy restarts our container but not FlareSolverr, so the old
+    /// `musescore-*` / `ultimateguitar` sessions — and their Chromium — leak
+    /// until something destroys them), and at shutdown so this instance
+    /// doesn't strand its own.
+    pub async fn purge_all_sessions(&self) -> usize {
+        let ids = match self.list_sessions().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "flaresolverr: could not list sessions to purge");
+                return 0;
+            }
+        };
+        let mut reaped = 0;
+        for id in &ids {
+            match self.destroy_session(id).await {
+                Ok(()) => reaped += 1,
+                Err(e) => {
+                    tracing::warn!(session = %id, error = %format!("{e:#}"), "flaresolverr: failed to destroy session during purge");
+                }
+            }
+        }
+        reaped
+    }
+
     /// Issue a GET through FlareSolverr. Bubbles up the FS error on
     /// non-`ok` status so the caller's error path treats CF failures
     /// uniformly with direct-fetch failures. When `session` is Some,
@@ -318,4 +409,43 @@ fn is_missing_session_message(msg: &str) -> bool {
             || m.contains("doesn't exist")
             || m.contains("not found")
             || m.contains("no such session"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_sessions_list_with_ids() {
+        // Shape FlareSolverr's `sessions.list` returns. `purge_all_sessions`
+        // feeds these IDs straight into `sessions.destroy`.
+        let body = r#"{"status":"ok","message":"","sessions":["musescore-0","musescore-1","ultimateguitar"]}"#;
+        let env: FsSessionsList = serde_json::from_str(body).unwrap();
+        assert_eq!(env.status, "ok");
+        assert_eq!(
+            env.sessions,
+            vec!["musescore-0", "musescore-1", "ultimateguitar"]
+        );
+    }
+
+    #[test]
+    fn parses_sessions_list_when_empty() {
+        // `sessions` omitted entirely (no live sessions) must not fail to
+        // deserialize — purge should treat it as "nothing to reap".
+        let env: FsSessionsList = serde_json::from_str(r#"{"status":"ok"}"#).unwrap();
+        assert!(env.sessions.is_empty());
+    }
+
+    #[test]
+    fn missing_session_message_matches_wording_variants() {
+        for m in [
+            "Error: This session does not exist.",
+            "Session 'foo' doesn't exist.",
+            "session not found",
+            "No such session",
+        ] {
+            assert!(is_missing_session_message(m), "should match: {m}");
+        }
+        assert!(!is_missing_session_message("challenge solve timeout"));
+    }
 }
