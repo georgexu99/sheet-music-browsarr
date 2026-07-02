@@ -4,8 +4,16 @@
    and `search_musescore.html` (the deferred MuseScore block) so the two
    render byte-identical cards. #}
 <li>
+  {# MuseScore has CAPTCHA-gated its /api/jmuse asset endpoint
+     (422 CAPTCHA_PASS_REQUIRED), so our server-side PNG-stitch PDF path
+     can no longer resolve pages — the /pdf route just errors and
+     303-redirects to musescore.com anyway. Link MuseScore cards straight
+     to the source page instead of through the dead PDF endpoint, so the
+     card is an honest "view on MuseScore" link rather than a broken
+     download button. Every other source still serves a real proxied PDF
+     via /pdf. Revert this branch if MuseScore drops the jmuse gate. #}
   <a
-    href="/pdf/{{ r.source }}/{{ r.id }}"
+    href="{% if r.source == "musescore" %}{{ r.external_url }}{% else %}/pdf/{{ r.source }}/{{ r.id }}{% endif %}"
     target="_blank"
     rel="noopener"
     class="block p-4 rounded-lg border border-gray-200 dark:border-gray-800 hover:border-gray-300 dark:hover:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-900/40 transition-colors no-underline text-inherit"
@@ -69,6 +77,18 @@
             <p class="text-sm text-gray-500 dark:text-gray-400 leading-relaxed line-clamp-2">{{ desc }}</p>
           {% when None %}
         {% endmatch %}
+        {# MuseScore-only affordance: these cards link out to musescore.com
+           (no downloadable PDF — see the href comment above), so signal
+           that explicitly rather than implying an in-app download like the
+           other sources. #}
+        {% if r.source == "musescore" %}
+          <p class="mt-2 inline-flex items-center gap-1 text-xs font-medium text-gray-500 dark:text-gray-400">
+            View on MuseScore
+            <svg width="12" height="12" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="m4.5 19.5 15-15M8.25 4.5h11.25v11.25"/>
+            </svg>
+          </p>
+        {% endif %}
       </div>
     </div>
   </a>
