@@ -778,7 +778,7 @@ async fn search(
     // selected sources. Page 2+ (infinite scroll) already loaded them on page
     // 1; appends are handled above.
     let musescore_defer_url = if page == 1 && deferred_selected {
-        Some(build_musescore_defer_url(&query, &filters))
+        Some(build_musescore_defer_url(&query, &filters, source_filter.as_ref()))
     } else {
         None
     };
@@ -795,12 +795,18 @@ async fn search(
 }
 
 /// Build the `/search?defer=musescore&…` URL the deferred loader fetches.
-/// Carries the query plus the filters MuseScore needs: `instrument` is
-/// pushed down to MuseScore's upstream facet, while difficulty / score_type
-/// / pd_only are re-applied post-hoc in the defer-mode handler. The
-/// `sources` param is intentionally omitted — defer mode forces a
-/// MuseScore-only fan-out regardless.
-fn build_musescore_defer_url(query: &str, filters: &SearchFilters) -> String {
+/// Carries the query, the filters each source needs (`instrument` is pushed
+/// down to upstream facets; `difficulty` / `score_type` / `pd_only` are
+/// re-applied post-hoc in the defer-mode handler), AND the user's `sources`
+/// selection. The `sources` param is critical: the defer handler narrows
+/// `active_sources` to the intersection of (user selection × deferred
+/// sources), so without it a user who unchecked MuseScore would still see
+/// MuseScore cards leak in via the deferred block (and vice versa for UG).
+fn build_musescore_defer_url(
+    query: &str,
+    filters: &SearchFilters,
+    source_filter: Option<&HashSet<String>>,
+) -> String {
     let mut url = format!("/search?defer=musescore&q={}", urlencoding::encode(query));
     if let Some(i) = filters.instrument {
         url.push_str("&instrument=");
@@ -816,6 +822,16 @@ fn build_musescore_defer_url(query: &str, filters: &SearchFilters) -> String {
     }
     if filters.public_domain_only {
         url.push_str("&pd_only=1");
+    }
+    if let Some(filter) = source_filter {
+        // HashSet iteration order is non-deterministic; sort so the URL is
+        // stable across renders. Comma-separated is fine — `parse_source_
+        // filter` accepts both `?sources=a,b` and repeated `?sources=a&
+        // sources=b` forms.
+        let mut ids: Vec<&str> = filter.iter().map(String::as_str).collect();
+        ids.sort();
+        url.push_str("&sources=");
+        url.push_str(&urlencoding::encode(&ids.join(",")));
     }
     url
 }
