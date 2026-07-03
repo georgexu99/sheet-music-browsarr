@@ -24,18 +24,51 @@ back to the preview link is `pdf_handler` in `src/routes/public.rs`.
 
 `fetch_pdf_bytes(id)` does, in order:
 
-1. **`fetch_score_page`** → `fetch_html_challenged` (FlareSolverr / `cf_clearance`).
-   Breaks if Cloudflare/FlareSolverr is down. Logs: `flaresolverr …`, `Just a moment`.
-2. **`extract_bundle_url`** — find the `…/static/public/build/…/N.<hash>.js` URL
-   in the page HTML. Breaks if MuseScore changes the bundle path shape
-   (`matches_bundle_pattern`). Error: `could not find musescore bundle URL`.
-3. **`extract_score_meta`** → `find_pages_count` — page count from the hydration JSON.
-4. **`prepare_algorithm`** → `find_random_token` — extract the **salt** from the
-   bundle. Error: `randomToken salt not found in musescore bundle`.
-5. **`mint_tokens`** — compute the per-page token **natively** (MD5). See below.
-6. **`jmuse_url`** per page → CDN PNG fetch → **`assemble_pdf`**.
-   `musescore jmuse error: …` means the token/salt is wrong, OR the score is
-   MuseScore-Pro-only content (expected for some scores — try another).
+1. **`fetch_score_page`** → `fetch_html_challenged`. **Direct-first**
+   (dl-librescore's method): `try_direct` does a plain browser-style GET; only
+   if that comes back as a Cloudflare challenge (or non-2xx) does it fall back
+   to FlareSolverr, and only when `FLARESOLVERR_URL` is set. From a residential
+   egress (e.g. the NAS's home IP) the direct GET usually succeeds and FS is
+   never touched — so unsetting `FLARESOLVERR_URL` runs pure-direct. Breaks only
+   if the egress *is* Cloudflare-challenged AND there's no FS fallback (error:
+   `direct fetch did not return the page …; no FlareSolverr configured`) — the
+   fix there is a residential/HTTP proxy on the egress. Also lifts, best-effort,
+   the candidate bundle URLs, the page count, and the **static page-0 image
+   URL** (`<link as="image">`, `@`-suffix stripped) — none fatal on its own.
+2. **`extract_bundle_urls`** — collect *every* `…/build/musescore…/20….js` URL
+   (`is_bundle_candidate`), not just one. Empty is non-fatal (fallback salt covers it).
+3. **`extract_pages_count`** — hydration JSON (`extract_score_meta`), then a
+   `pages":<n>` regex fallback. Unknown ⇒ assume 1 with a loud `warn!` (a
+   multi-page score would otherwise truncate silently).
+4. **`prepare_algorithm`** → `find_random_token` — try each candidate bundle,
+   return the salt from the first that has the `"…").substr(0,4)` literal.
+   Now returns `Option` (no salt is non-fatal — the fallback takes over).
+5. **`mint_token`** per page — compute the token **natively** (MD5). See below.
+6. **`resolve_page_url`** → **`jmuse_url`** per page (page 0 uses the static URL,
+   no token) → CDN PNG fetch → **`assemble_pdf`**. Each page tries the extracted
+   salt then the **hardcoded fallback salt** before failing; the winning salt is
+   reused for later pages. `musescore jmuse error: …` on *both* salts means the
+   score is MuseScore-Pro-only content (expected for some — try another), or the
+   fallback salt has gone stale (see below).
+
+**All direct calls (bundle JS, `/api/jmuse`, CDN PNG) now replay the
+FlareSolverr-harvested User-Agent** (`current_ua` → `get_with_ua`) so the
+`cf_clearance` cookie — bound to (IP, UA) — isn't rejected by Cloudflare on a
+UA mismatch. If jmuse starts returning the "Just a moment" HTML on the *direct*
+call (JSON parse error) even though the score page loads, suspect this UA
+alignment first.
+
+## The hardcoded fallback salt
+
+`FALLBACK_SALT` (currently `9654,4e`) mirrors the value committed in
+LibreScore/dl-librescore's `src/file.ts`
+(`md5(`${id}${type}${index}9654,4e`).slice(0,4)`). It's tried after the
+bundle-extracted salt, so a broken/renamed bundle chunk no longer kills
+downloads. **When downloads break with `jmuse error` on every score and the
+bundle salt looks wrong, first bump `FALLBACK_SALT` to dl-librescore's current
+value** (grep their `file.ts` for `.slice(0, 4)`) — that's the fastest recovery
+and needs no bundle-format reverse-engineering. Keep extracting the live salt
+too; the constant is only the safety net.
 
 ## The token algorithm — the thing that matters
 

@@ -16,9 +16,13 @@ use tokio::sync::Mutex;
 use super::flaresolverr::{FlareSolverr, FsError, FsSolution};
 use super::{BadgeKind, MetadataBadge, SearchFilters, SearchResult, Source};
 
-/// Env var name. When set, MuseScore's Cloudflare-challenged GETs go
-/// through FlareSolverr (the score-page and the /sheetmusic search page).
-/// Bundle JS, /api/jmuse, and CDN PNG fetches stay direct.
+/// Env var name. MuseScore fetches now try a direct browser-style request
+/// first (dl-librescore's method); when set, this is the FlareSolverr endpoint
+/// we fall back to *only if* a direct score-page / `/sheetmusic` search fetch
+/// comes back as a Cloudflare challenge. Bundle JS, /api/jmuse, and CDN PNG
+/// fetches are always direct (they replay any harvested `cf_clearance` + UA).
+/// Leave it unset to run pure-direct — correct when the host's egress isn't
+/// Cloudflare-challenged (e.g. a residential IP), the way dl-librescore runs.
 const FLARESOLVERR_ENV: &str = "FLARESOLVERR_URL";
 
 /// Env var controlling the FlareSolverr session pool size. Each session
@@ -78,6 +82,17 @@ const WARM_URL: &str = "https://musescore.com/sheetmusic";
 /// the download phase of a multi-page score roughly linearly while staying
 /// polite.
 const PNG_FETCH_CONCURRENCY: usize = 4;
+
+/// Hardcoded fallback salt for the jmuse MD5 token, mirroring the value
+/// committed in LibreScore/dl-librescore's `src/file.ts` (there:
+/// `md5(`${id}${type}${index}9654,4e`).slice(0, 4)`). MuseScore's per-deploy
+/// salt lives in the JS bundle and we extract it at runtime, but that
+/// extraction is the most fragile stage (bundle chunk renames, minifier
+/// churn). When the extracted salt's token is rejected — or no salt could be
+/// extracted at all — we retry with this known-good value before giving up.
+/// It changes rarely; when it does, dl-librescore's repo is the place to
+/// pick up the new one.
+const FALLBACK_SALT: &str = "9654,4e";
 
 /// Per-request headers a real Chrome sends on a top-level navigation
 /// (typed URL / link click). Cloudflare's bot heuristics weight these
@@ -174,8 +189,8 @@ pub struct Musescore {
     /// every cold-start / cookie-expiry boundary each variant would
     /// otherwise launch its own 5–30 s headless-Chromium solve. Serializing
     /// the *decision to solve* lets the first caller mint the `cf_clearance`;
-    /// the rest wake, replay it via `try_direct_clearance`, and skip
-    /// FlareSolverr entirely. Only the leader pays the solve cost.
+    /// the rest wake, replay it via `try_direct`, and skip FlareSolverr
+    /// entirely. Only the leader pays the solve cost.
     fs_solve_lock: Mutex<()>,
     cached: Mutex<Option<CachedAlgorithm>>,
     /// Unix timestamp (seconds) of the last user-driven search / PDF fetch,
@@ -502,154 +517,137 @@ impl Musescore {
         }
     }
 
-    /// Fetch a Cloudflare-challenged URL. Routes through FlareSolverr if
-    /// configured; falls back to a direct fetch otherwise. Cookies from
-    /// the FS response are injected into our shared jar so subsequent
-    /// direct fetches (bundle JS, /api/jmuse, CDN PNGs) carry the
-    /// `cf_clearance` if MuseScore expands CF coverage to those paths.
-    ///
-    /// FS call has up to two attempts: if the first one returns
-    /// `SessionMissing` (nightly refresh just destroyed our slot, FS
-    /// restarted, or our session leaked between acquire and use), we
-    /// invalidate that slot and retry with a freshly-created session.
-    /// Other errors fail fast — they're typically challenge timeouts or
-    /// transport errors, which retrying wouldn't fix.
+    /// Fetch a Cloudflare-gated MuseScore HTML page (score page or search
+    /// page), **preferring a direct browser-style request** — dl-librescore's
+    /// method. From a residential egress Cloudflare usually doesn't challenge,
+    /// so the direct fetch returns the page and FlareSolverr is never touched.
+    /// Only when the direct fetch comes back as a challenge (or otherwise fails
+    /// to yield the page) do we fall back to FlareSolverr, if configured;
+    /// cookies it captures are injected into our shared jar so later direct
+    /// calls (bundle JS, /api/jmuse, CDN PNGs) can replay the `cf_clearance`.
     async fn fetch_html_challenged(&self, url: &str, ctx_label: &'static str) -> anyhow::Result<String> {
-        match &self.fs {
-            Some(fs) => {
-                // Fast path: once a prior solve has minted a `cf_clearance`
-                // cookie (now sitting in our jar) and told us the UA it was
-                // bound to, replay both on a plain reqwest GET. That skips
-                // FlareSolverr's headless-Chromium round-trip entirely —
-                // sub-second instead of seconds. Gated on having learned the
-                // UA (our proxy for "we've solved at least once"); a
-                // stale/expired cookie just 403s or returns the challenge
-                // page, and we fall through to the FlareSolverr path below.
-                if let Some(html) = self.try_direct_clearance(url, ctx_label).await {
-                    return Ok(html);
-                }
+        // Primary path (dl-librescore): a direct browser fetch.
+        let direct_miss = match self.try_direct(url, ctx_label).await {
+            Ok(html) => return Ok(html),
+            Err(reason) => reason,
+        };
 
-                // Slow path. Coalesce concurrent solvers: the i18n fan-out
-                // lands up to 4 variants here at once when the cookie's
-                // stale, but only one needs to drive FlareSolverr. Hold the
-                // solve gate, then re-check the fast path — a peer solve that
-                // landed while we were queued has already refreshed the jar +
-                // UA, so our replay now succeeds and we skip the redundant
-                // headless-Chromium round-trip. The guard stays held through
-                // the absorb/remember below so waiters only wake once the
-                // fresh cookie + UA are actually in place.
-                let _solve_guard = self.fs_solve_lock.lock().await;
-                if let Some(html) = self.try_direct_clearance(url, ctx_label).await {
-                    return Ok(html);
-                }
+        let Some(fs) = self.fs.as_ref() else {
+            // No FlareSolverr fallback wired — the direct fetch is all we have.
+            anyhow::bail!(
+                "musescore {ctx_label}: direct fetch did not return the page ({direct_miss}); \
+                 no FlareSolverr configured — set FLARESOLVERR_URL or route egress through an \
+                 unchallenged proxy ({url})"
+            );
+        };
 
-                // Two-shot loop: try a session, retry once on missing.
-                // Any other FS error bails on the first attempt.
-                for attempt in 0..2 {
-                    let session = self.acquire_session().await;
-                    match fs.get(url, session.as_deref()).await {
-                        Ok(solution) => {
-                            if solution.status >= 400 {
-                                anyhow::bail!(
-                                    "flaresolverr {ctx_label} HTTP {}: {}",
-                                    solution.status,
-                                    truncate_for_log(&solution.response, 200)
-                                );
-                            }
-                            self.absorb_fs_cookies(&solution);
-                            self.remember_fs_ua(&solution.user_agent).await;
-                            return Ok(solution.response);
-                        }
-                        Err(FsError::SessionMissing { session: gone }) if attempt == 0 => {
-                            tracing::info!(
-                                session = %gone,
-                                ctx = ctx_label,
-                                "FlareSolverr reported session missing; invalidating slot and retrying"
-                            );
-                            self.invalidate_session(&gone).await;
-                            continue;
-                        }
-                        Err(e) => {
-                            return Err(anyhow::Error::new(e))
-                                .with_context(|| format!("flaresolverr {ctx_label} {url}"));
-                        }
+        tracing::debug!(
+            ctx = ctx_label,
+            reason = %direct_miss,
+            "musescore: direct fetch challenged; falling back to FlareSolverr"
+        );
+
+        // Coalesce concurrent solvers: the i18n fan-out lands up to 4 variants
+        // here at once when direct is challenged, but only one needs to drive
+        // FlareSolverr. Hold the solve gate, then re-check the direct path — a
+        // peer solve that landed while we were queued has already refreshed the
+        // jar + UA, so our replay now succeeds and we skip the redundant
+        // headless-Chromium round-trip. The guard stays held through the
+        // absorb/remember below so waiters only wake once the fresh cookie + UA
+        // are actually in place.
+        let _solve_guard = self.fs_solve_lock.lock().await;
+        if let Ok(html) = self.try_direct(url, ctx_label).await {
+            return Ok(html);
+        }
+
+        // Two-shot loop: try a session, retry once on missing. Any other FS
+        // error bails on the first attempt.
+        for attempt in 0..2 {
+            let session = self.acquire_session().await;
+            match fs.get(url, session.as_deref()).await {
+                Ok(solution) => {
+                    if solution.status >= 400 {
+                        anyhow::bail!(
+                            "flaresolverr {ctx_label} HTTP {}: {}",
+                            solution.status,
+                            truncate_for_log(&solution.response, 200)
+                        );
                     }
+                    self.absorb_fs_cookies(&solution);
+                    self.remember_fs_ua(&solution.user_agent).await;
+                    return Ok(solution.response);
                 }
-                // Loop only exits via continue (one retry permitted) or
-                // an early return; reaching this line means we retried
-                // and hit SessionMissing twice in a row, which suggests
-                // FS itself is unhealthy.
-                anyhow::bail!(
-                    "flaresolverr {ctx_label} {url}: session missing twice in a row (FS may be unhealthy)"
-                );
-            }
-            None => {
-                let mut req = self.http.get(url);
-                for (k, v) in nav_headers() {
-                    req = req.header(k, v);
+                Err(FsError::SessionMissing { session: gone }) if attempt == 0 => {
+                    tracing::info!(
+                        session = %gone,
+                        ctx = ctx_label,
+                        "FlareSolverr reported session missing; invalidating slot and retrying"
+                    );
+                    self.invalidate_session(&gone).await;
+                    continue;
                 }
-                let resp = req
-                    .send()
-                    .await
-                    .with_context(|| format!("musescore {ctx_label} request"))?;
-                let status = resp.status();
-                if !status.is_success() {
-                    let body = resp.text().await.unwrap_or_default();
-                    let snippet = truncate_for_log(&body, 200);
-                    anyhow::bail!("musescore {ctx_label} HTTP {status}: {snippet}");
+                Err(e) => {
+                    return Err(anyhow::Error::new(e))
+                        .with_context(|| format!("flaresolverr {ctx_label} {url}"));
                 }
-                resp.text()
-                    .await
-                    .with_context(|| format!("musescore {ctx_label} body"))
             }
         }
+        // Loop only exits via continue (one retry permitted) or an early
+        // return; reaching this line means we retried and hit SessionMissing
+        // twice in a row, which suggests FS itself is unhealthy.
+        anyhow::bail!(
+            "flaresolverr {ctx_label} {url}: session missing twice in a row (FS may be unhealthy)"
+        );
     }
 
-    /// Attempt a direct fetch of a CF-challenged URL, replaying the
-    /// `cf_clearance` cookie (already in our jar from a prior FS solve)
-    /// under the UA that cookie is bound to. Returns `Some(html)` only on a
-    /// clean 200 that isn't a Cloudflare interstitial; every failure mode
-    /// (no UA learned yet, transport error, non-2xx, challenge page)
-    /// returns `None` so the caller transparently falls back to
-    /// FlareSolverr. This keeps the optimization regression-safe: a missing
-    /// or expired cookie costs one cheap GET, then proceeds exactly as
-    /// before.
-    async fn try_direct_clearance(&self, url: &str, ctx_label: &'static str) -> Option<String> {
-        // No UA means we've never solved, so we almost certainly hold no
-        // `cf_clearance` either — skip straight to FlareSolverr.
-        let ua = self.fs_ua.lock().await.clone()?;
-        // Per-request `User-Agent` overrides the Client's default so the
-        // header matches the (IP, UA) the cookie was issued against. The
-        // cookie itself is attached automatically by the jar.
-        let mut req = self.http.get(url).header(header::USER_AGENT, ua);
+    /// Attempt a direct browser-style fetch of a Cloudflare-gated page —
+    /// dl-librescore's primary method. Sends full navigation headers and, when
+    /// we've learned one from a prior FlareSolverr solve, the `cf_clearance`-
+    /// bound User-Agent (the cookie itself rides along automatically from the
+    /// jar); otherwise the Client's default browser UA. Returns `Ok(html)` only
+    /// on a clean 2xx that isn't a Cloudflare interstitial. `Err(reason)` means
+    /// "didn't get the page" — a challenge, a non-2xx, or a transport error;
+    /// the caller decides whether to fall back to FlareSolverr. The reason
+    /// string feeds the debug log and the no-FS error message.
+    ///
+    /// Unlike the old clearance-only fast path, this runs even before we've
+    /// ever solved (cold), so a residential egress that Cloudflare never
+    /// challenges resolves every page here without FlareSolverr.
+    async fn try_direct(&self, url: &str, ctx_label: &'static str) -> Result<String, String> {
+        // Replay the cf_clearance-bound UA if we have one; else the Client's
+        // default browser UA. `nav_headers` make this look like a top-level
+        // navigation, which Cloudflare's heuristics weight heavily.
+        let ua = self.fs_ua.lock().await.clone();
+        let mut req = self.http.get(url);
+        if let Some(ua) = ua {
+            req = req.header(header::USER_AGENT, ua);
+        }
         for (k, v) in nav_headers() {
             req = req.header(k, v);
         }
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => {
-                tracing::debug!(ctx = ctx_label, error = %e, "musescore direct-clearance transport error; falling back to FlareSolverr");
-                return None;
-            }
+            Err(e) => return Err(format!("transport error: {e}")),
         };
         let status = resp.status();
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("body read error: {e}"))?;
         if !status.is_success() {
-            tracing::debug!(ctx = ctx_label, %status, "musescore direct-clearance non-success (cookie likely expired); falling back to FlareSolverr");
-            return None;
+            return Err(format!("HTTP {status}: {}", truncate_for_log(&body, 160)));
         }
-        let body = resp.text().await.ok()?;
         if looks_like_cf_challenge(&body) {
-            tracing::debug!(ctx = ctx_label, "musescore direct-clearance returned a CF interstitial; falling back to FlareSolverr");
-            return None;
+            return Err("Cloudflare challenge interstitial".to_string());
         }
-        tracing::debug!(ctx = ctx_label, "musescore direct-clearance hit (skipped FlareSolverr)");
-        Some(body)
+        tracing::debug!(ctx = ctx_label, "musescore: direct fetch hit (no FlareSolverr needed)");
+        Ok(body)
     }
 
     /// Remember the UA FlareSolverr's Chromium used on a successful solve so
-    /// the next `try_direct_clearance` replays `cf_clearance` under the same
-    /// UA. Empty UAs (older FS builds occasionally omit the field) are
-    /// ignored so we don't poison the fast path with a blank header.
+    /// the next `try_direct` replays `cf_clearance` under the same UA. Empty
+    /// UAs (older FS builds occasionally omit the field) are ignored so we
+    /// don't poison the direct path with a blank header.
     async fn remember_fs_ua(&self, ua: &str) {
         if ua.is_empty() {
             return;
@@ -688,53 +686,104 @@ impl Musescore {
         }
     }
 
-    /// Fetch a score page and parse out the bundle URL plus the hydration
-    /// JSON. Returns (bundle_url, score_meta).
-    async fn fetch_score_page(&self, id: &str) -> anyhow::Result<(String, ScoreMeta)> {
+    /// Snapshot the User-Agent our most recent FlareSolverr solve reported.
+    /// `cf_clearance` is bound to the (IP, UA) tuple, so every *direct*
+    /// request that must satisfy Cloudflare (bundle JS, `/api/jmuse`, CDN
+    /// image) has to replay this exact UA or the cookie is rejected and we
+    /// get a challenge page instead of our payload. `None` when FlareSolverr
+    /// was never configured / has never solved — in that mode there's no
+    /// `cf_clearance` to protect and the Client's default UA is used.
+    async fn current_ua(&self) -> Option<String> {
+        self.fs_ua.lock().await.clone()
+    }
+
+    /// Build a GET request builder, overriding the User-Agent with `ua` when
+    /// present so the reqwest call matches the UA `cf_clearance` was minted
+    /// under. Used for every direct (non-FlareSolverr) fetch.
+    fn get_with_ua(&self, url: &str, ua: Option<&str>) -> reqwest::RequestBuilder {
+        let mut req = self.http.get(url);
+        if let Some(ua) = ua {
+            req = req.header(header::USER_AGENT, ua);
+        }
+        req
+    }
+
+    /// Fetch a score page and extract everything the download pipeline needs
+    /// from it: the candidate bundle URLs (salt lives in one of them), the
+    /// page count, and the statically-embedded page-0 image URL.
+    async fn fetch_score_page(&self, id: &str) -> anyhow::Result<ScorePage> {
         let url = format!("https://musescore.com/score/{id}");
         let html = self.fetch_html_challenged(&url, "page").await?;
 
-        let bundle_url = extract_bundle_url(&html)
-            .ok_or_else(|| anyhow::anyhow!("could not find musescore bundle URL on {url}"))?;
-        let meta = extract_score_meta(&html)
-            .ok_or_else(|| anyhow::anyhow!("could not parse hydration JSON on {url}"))?;
-        Ok((bundle_url, meta))
+        // None of these are fatal on their own anymore: a missing bundle just
+        // means we lean on the fallback salt; a missing page-0 URL means we
+        // resolve page 0 via jmuse like the rest; a missing page count
+        // defaults to 1. Only a page we can't fetch at all aborts the job.
+        let bundle_urls = extract_bundle_urls(&html);
+        let pages_count = extract_pages_count(&html);
+        let first_page_url = extract_first_page_url(&html);
+        if bundle_urls.is_empty() {
+            tracing::debug!(
+                id,
+                "musescore: no bundle URL on score page; relying on fallback salt"
+            );
+        }
+        Ok(ScorePage {
+            bundle_urls,
+            pages_count,
+            first_page_url,
+        })
     }
 
-    /// Fetch the page's JS bundle and extract the `salt` MuseScore
-    /// concatenates into the per-page jmuse MD5 token, reusing the cache if
-    /// the bundle URL hasn't changed.
-    async fn prepare_algorithm(&self, bundle_url: &str) -> anyhow::Result<String> {
+    /// Extract the per-deploy `salt` MuseScore concatenates into the jmuse
+    /// MD5 token. MuseScore ships several bundles per page and moves the
+    /// token code between chunks across deploys, so — like dl-librescore —
+    /// we walk *every* candidate bundle and return the salt from the first
+    /// one that carries the `"…").substr(0, 4)` literal. Returns `None` when
+    /// no bundle yields a salt; the caller then falls back to
+    /// [`FALLBACK_SALT`]. The winning (bundle_url, salt) pair is cached; a
+    /// later page whose bundle set still contains that URL reuses it without
+    /// re-downloading.
+    async fn prepare_algorithm(&self, bundle_urls: &[String], ua: Option<&str>) -> Option<String> {
         {
             let guard = self.cached.lock().await;
             if let Some(cached) = guard.as_ref() {
-                if cached.bundle_url == bundle_url {
-                    return Ok(cached.random_token.clone());
+                if bundle_urls.iter().any(|u| u == &cached.bundle_url) {
+                    return Some(cached.random_token.clone());
                 }
             }
         }
 
-        let bundle = self
-            .http
-            .get(bundle_url)
-            .send()
-            .await
-            .context("musescore bundle fetch")?
-            .error_for_status()
-            .context("musescore bundle status")?
-            .text()
-            .await
-            .context("musescore bundle body")?;
+        for bundle_url in bundle_urls {
+            let bundle = match self
+                .get_with_ua(bundle_url, ua)
+                .send()
+                .await
+                .and_then(|r| r.error_for_status())
+            {
+                Ok(r) => match r.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::debug!(bundle_url = %bundle_url, error = %e, "musescore: bundle body read failed; trying next");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::debug!(bundle_url = %bundle_url, error = %e, "musescore: bundle fetch failed; trying next");
+                    continue;
+                }
+            };
 
-        let random_token = find_random_token(&bundle)
-            .ok_or_else(|| anyhow::anyhow!("randomToken salt not found in musescore bundle"))?;
-
-        let mut guard = self.cached.lock().await;
-        *guard = Some(CachedAlgorithm {
-            bundle_url: bundle_url.to_string(),
-            random_token: random_token.clone(),
-        });
-        Ok(random_token)
+            if let Some(salt) = find_random_token(&bundle) {
+                let mut guard = self.cached.lock().await;
+                *guard = Some(CachedAlgorithm {
+                    bundle_url: bundle_url.clone(),
+                    random_token: salt.clone(),
+                });
+                return Some(salt);
+            }
+        }
+        None
     }
 
     /// Hit `/api/jmuse` for a single (id, type, index) tuple and return the
@@ -746,11 +795,11 @@ impl Musescore {
         id: &str,
         media_type: &str,
         index: usize,
+        ua: Option<&str>,
     ) -> anyhow::Result<String> {
         let url = format!("https://musescore.com/api/jmuse?id={id}&index={index}&type={media_type}");
         let http_resp = self
-            .http
-            .get(&url)
+            .get_with_ua(&url, ua)
             .header(reqwest::header::AUTHORIZATION, token)
             .header(reqwest::header::REFERER, referer)
             .send()
@@ -789,10 +838,9 @@ impl Musescore {
     }
 
     /// GET a CDN URL and return the body, bounded by `max_bytes`.
-    async fn fetch_bytes(&self, url: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    async fn fetch_bytes(&self, url: &str, max_bytes: usize, ua: Option<&str>) -> anyhow::Result<Vec<u8>> {
         let resp = self
-            .http
-            .get(url)
+            .get_with_ua(url, ua)
             .send()
             .await
             .context("musescore cdn fetch")?
@@ -814,6 +862,41 @@ impl Musescore {
             buf.extend_from_slice(&chunk);
         }
         Ok(buf)
+    }
+
+    /// Resolve a single page's CDN image URL through `/api/jmuse`. Tries the
+    /// candidate salts in priority order (bundle-extracted first, then
+    /// [`FALLBACK_SALT`]) until the server accepts one, and records the
+    /// winner in `working_salt` so every subsequent page mints straight from
+    /// it — no wasted jmuse round-trips on the hair-trigger-rate-limited
+    /// endpoint. Returns the last error if every candidate is rejected.
+    async fn resolve_page_url(
+        &self,
+        id: &str,
+        referer: &str,
+        index: usize,
+        candidate_salts: &[String],
+        working_salt: &mut Option<String>,
+        ua: Option<&str>,
+    ) -> anyhow::Result<String> {
+        if let Some(salt) = working_salt.clone() {
+            let token = mint_token(&salt, id, "img", index);
+            return self.jmuse_url(&token, referer, id, "img", index, ua).await;
+        }
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for salt in candidate_salts {
+            let token = mint_token(salt, id, "img", index);
+            match self.jmuse_url(&token, referer, id, "img", index, ua).await {
+                Ok(url) => {
+                    *working_salt = Some(salt.clone());
+                    return Ok(url);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| anyhow::anyhow!("no salt candidates available for page {index}")))
     }
 }
 
@@ -968,34 +1051,82 @@ impl Source for Musescore {
 
     async fn fetch_pdf_bytes(&self, id: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
         self.mark_activity();
-        let (bundle_url, meta) = self.fetch_score_page(id).await?;
-        let pages_count = meta.pages_count.unwrap_or(1).max(1);
+        let page = self.fetch_score_page(id).await?;
+        // UA the score page (and therefore the fresh cf_clearance cookie) was
+        // just solved under. Replay it on the direct bundle/jmuse/CDN calls so
+        // Cloudflare doesn't re-challenge them under a mismatched fingerprint.
+        // Snapshot *after* fetch_score_page so we capture the UA of the solve
+        // it may have triggered. None in direct-only (no-FlareSolverr) mode.
+        let ua = self.current_ua().await;
+        let ua_ref = ua.as_deref();
+
+        // A missing page count means the page layout drifted out from under
+        // both extractors. We assume 1 so single-page scores still work, but
+        // warn loudly: for a multi-page score this silently truncates to page
+        // 0, producing a valid-looking but incomplete PDF. The warning surfaces
+        // that in logs / source health rather than failing silently.
+        if page.pages_count.is_none() {
+            tracing::warn!(
+                id,
+                "musescore: page count unreadable; assuming 1 page (a multi-page score would be truncated)"
+            );
+        }
+        let pages_count = page.pages_count.unwrap_or(1).max(1);
         anyhow::ensure!(pages_count <= 200, "musescore score has implausible pages_count={pages_count}");
         let referer = self.external_url(id);
 
-        let salt = self.prepare_algorithm(&bundle_url).await?;
-        // One line that pins the download attempt: how many pages we're about
-        // to request and that a salt was extracted. If page 0 resolves but a
-        // later index 404s, this number vs. the failing index says whether
-        // we over-counted pages or hit a paywalled page.
+        // SVG scores would need a rasterizer we don't bundle (printpdf is
+        // PNG-only). Detect from the page-0 preload URL and fail with a clear
+        // message rather than a cryptic decode error deep inside assembly.
+        if let Some(u) = &page.first_page_url {
+            anyhow::ensure!(
+                !is_svg_asset(u),
+                "musescore score {id} serves SVG page images, which aren't supported yet"
+            );
+        }
+
+        // Candidate salts in priority order: the one lifted from the live
+        // bundle (if any), then dl-librescore's hardcoded fallback. Deduped so
+        // a bundle that literally ships `9654,4e` isn't tried twice.
+        let extracted = self.prepare_algorithm(&page.bundle_urls, ua_ref).await;
+        let mut candidate_salts: Vec<String> = Vec::new();
+        if let Some(s) = extracted {
+            candidate_salts.push(s);
+        }
+        if !candidate_salts.iter().any(|s| s == FALLBACK_SALT) {
+            candidate_salts.push(FALLBACK_SALT.to_string());
+        }
+
         tracing::info!(
             id,
             pages_count,
-            salt_len = salt.len(),
+            salt_candidates = candidate_salts.len(),
+            static_page0 = page.first_page_url.is_some(),
             "musescore: resolving page images"
         );
 
-        // Mint every page's token natively (cheap MD5), then resolve CDN URLs
-        // via `/api/jmuse` *serially*. The jmuse resolve stays serial because
-        // musescore's per-IP rate limit on that endpoint is hair-trigger.
-        let tokens = mint_tokens(&salt, id, "img", pages_count);
-
-        let mut png_urls = Vec::with_capacity(pages_count);
-        for (index, token) in tokens.iter().enumerate() {
+        // Resolve a CDN image URL per page. Page 0's URL is embedded in the
+        // score page itself (dl-librescore's trick), so a single-page score
+        // needs no token at all. Remaining pages hit `/api/jmuse` *serially*
+        // (its per-IP rate limit is hair-trigger), trying each candidate salt
+        // until one is accepted and then reusing that salt.
+        let mut working_salt: Option<String> = None;
+        let mut png_urls: Vec<String> = Vec::with_capacity(pages_count);
+        for index in 0..pages_count {
+            if index == 0 {
+                if let Some(u) = &page.first_page_url {
+                    png_urls.push(u.clone());
+                    continue;
+                }
+            }
             let url = self
-                .jmuse_url(token, &referer, id, "img", index)
+                .resolve_page_url(id, &referer, index, &candidate_salts, &mut working_salt, ua_ref)
                 .await
                 .with_context(|| format!("resolving CDN url for page {index}"))?;
+            anyhow::ensure!(
+                !is_svg_asset(&url),
+                "musescore score {id} serves SVG page images, which aren't supported yet"
+            );
             png_urls.push(url);
         }
 
@@ -1012,7 +1143,7 @@ impl Source for Musescore {
         for chunk in png_urls.chunks(PNG_FETCH_CONCURRENCY) {
             let fetches = chunk
                 .iter()
-                .map(|url| self.fetch_bytes(url, per_page_budget));
+                .map(|url| self.fetch_bytes(url, per_page_budget, ua_ref));
             for bytes in futures_util::future::join_all(fetches).await {
                 let bytes = bytes?;
                 running = running.saturating_add(bytes.len());
@@ -1054,6 +1185,22 @@ struct JmuseInfo {
 #[derive(Debug)]
 struct ScoreMeta {
     pages_count: Option<usize>,
+}
+
+/// Everything the download pipeline lifts from a fetched score page. All
+/// fields are best-effort: an empty `bundle_urls` falls back to
+/// [`FALLBACK_SALT`], a `None` `first_page_url` resolves page 0 via jmuse
+/// like any other page, and a `None` `pages_count` defaults to 1.
+#[derive(Debug)]
+struct ScorePage {
+    /// Candidate app-bundle JS URLs, in document order, that may carry the
+    /// jmuse salt literal.
+    bundle_urls: Vec<String>,
+    /// Rendered page count, when we could read it from the page.
+    pages_count: Option<usize>,
+    /// The statically-embedded page-0 image URL (`<link as="image">`), which
+    /// needs no token — dl-librescore's first-page shortcut.
+    first_page_url: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1103,59 +1250,120 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Look for the JS bundle URL that matches the upstream extension's regex:
-///   `https://musescore.com/static/public/build/[\w\/]+/\d+/\d+\.\w+.js`
-/// The match is greedy; in practice MuseScore deploys one such URL per page.
-fn extract_bundle_url(html: &str) -> Option<String> {
-    // The link tag uses `<link rel='preload' href='...' as='script'>`.
-    // We just regex over the whole document so we don't depend on html5
-    // attribute-quote conventions.
+/// Collect every candidate MuseScore app-bundle JS URL on the page, in
+/// document order and deduped. Port of dl-librescore's suffix regex
+/// (`file.ts`):
+///   `/static/public/build/musescore.*?(?:_es6)?/20….js`
+/// Deliberately looser than a single strict match: MuseScore ships several
+/// bundles and relocates the token code between chunks across deploys, so the
+/// caller ([`Musescore::prepare_algorithm`]) tries each until one yields the
+/// salt literal, instead of betting on one filename shape.
+fn extract_bundle_urls(html: &str) -> Vec<String> {
     let needle = "https://musescore.com/static/public/build/";
+    let mut out: Vec<String> = Vec::new();
     let mut start = 0;
     while let Some(rel) = html[start..].find(needle) {
         let abs = start + rel;
         let tail = &html[abs..];
+        // Terminate on any character that can't appear in the URL — the same
+        // set the single-bundle scanner used, plus backslash (escaped JSON).
         let term = tail
-            .find(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r'))
+            .find(|c: char| matches!(c, '"' | '\'' | ' ' | '<' | '>' | '\n' | '\r' | '\\'))
             .unwrap_or(tail.len());
         let candidate = &tail[..term];
-        if matches_bundle_pattern(candidate) {
-            return Some(candidate.to_string());
+        if is_bundle_candidate(candidate) && !out.iter().any(|u| u == candidate) {
+            out.push(candidate.to_string());
         }
         start = abs + needle.len();
     }
-    None
+    out
 }
 
-/// Matches `https://musescore.com/static/public/build/<word|slash>+/\d+/\d+\.\w+\.js`
-fn matches_bundle_pattern(url: &str) -> bool {
+/// True for a `…/static/public/build/musescore…/20….js` URL — dl-librescore's
+/// bundle shape. We don't insist on a numeric filename head (MuseScore has
+/// shipped the token code in differently-named chunks), only that it's a
+/// `musescore*` build bundle under a `20YYMM` directory.
+fn is_bundle_candidate(url: &str) -> bool {
     let prefix = "https://musescore.com/static/public/build/";
     let Some(rest) = url.strip_prefix(prefix) else {
         return false;
     };
-    if !url.ends_with(".js") {
-        return false;
+    url.ends_with(".js") && rest.starts_with("musescore") && rest.contains("/20")
+}
+
+/// Best-effort page count. Tries the SSR hydration JSON first (richest,
+/// matches the search path), then dl-librescore's leaner regex
+/// (`/pages(?:&quot;|"):(\d+)/`) as a fallback for when the JSON layout has
+/// drifted but the raw field is still in the HTML.
+fn extract_pages_count(html: &str) -> Option<usize> {
+    if let Some(meta) = extract_score_meta(html) {
+        if let Some(pc) = meta.pages_count {
+            return Some(pc);
+        }
     }
-    let segments: Vec<&str> = rest.split('/').collect();
-    // We expect at least [<dir...>, <digits>, <digits>.<word>.js]
-    if segments.len() < 3 {
-        return false;
+    find_pages_count_regex(html)
+}
+
+/// Scan for `pages":<n>` / `pages&quot;:<n>` (the field survives even when the
+/// surrounding JSON is HTML-escaped inside a data attribute).
+fn find_pages_count_regex(html: &str) -> Option<usize> {
+    for needle in ["pages\":", "pages&quot;:"] {
+        let mut start = 0;
+        while let Some(off) = html[start..].find(needle) {
+            let abs = start + off + needle.len();
+            let digits: String = html[abs..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
+            if let Ok(n) = digits.parse::<usize>() {
+                if n > 0 {
+                    return Some(n);
+                }
+            }
+            start = abs;
+        }
     }
-    let last = segments[segments.len() - 1];
-    let second_last = segments[segments.len() - 2];
-    // <digits>.<word>.js
-    if !second_last.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    let last_no_ext = last.strip_suffix(".js").unwrap_or("");
-    let mut parts = last_no_ext.splitn(2, '.');
-    let head = parts.next().unwrap_or("");
-    let hash = parts.next().unwrap_or("");
-    if hash.is_empty() {
-        return false;
-    }
-    head.chars().all(|c| c.is_ascii_digit())
-        && hash.chars().all(|c| c.is_ascii_alphanumeric())
+    None
+}
+
+/// The statically-embedded page-0 image URL — MuseScore preloads it via
+/// `<link rel="preload" as="image" href="…">`, so page 0 needs no jmuse token
+/// (dl-librescore's first-page shortcut). Falls back to the first
+/// `<img src*="score_0">` if the preload link isn't present. The `@<size>`
+/// suffix is stripped (matching dl-librescore's `.split("@")[0]`) so page 0
+/// comes back at the same full resolution as the jmuse-resolved pages, not a
+/// scaled preview variant. SVG-vs-PNG discrimination is left to
+/// [`is_svg_asset`] at the call site.
+fn extract_first_page_url(html: &str) -> Option<String> {
+    let doc = Html::parse_document(html);
+    let raw = {
+        let link_sel = Selector::parse(r#"link[as="image"]"#).ok();
+        let img_sel = Selector::parse(r#"img[src*="score_0"]"#).ok();
+        link_sel
+            .and_then(|sel| {
+                doc.select(&sel)
+                    .find_map(|el| el.value().attr("href").map(str::to_string))
+            })
+            .or_else(|| {
+                img_sel.and_then(|sel| {
+                    doc.select(&sel)
+                        .find_map(|el| el.value().attr("src").map(str::to_string))
+                })
+            })
+            .filter(|s| !s.is_empty())?
+    };
+    // Drop the `@0` / `@2x` CDN size tag (and anything after it) so we fetch
+    // the canonical page image.
+    Some(raw.split('@').next().unwrap_or(&raw).to_string())
+}
+
+/// True if `url` points at an SVG asset. MuseScore serves either PNG or SVG
+/// page renderings; `printpdf` only decodes PNG, so the caller uses this to
+/// fail SVG scores with a clear message. Strips a `@`-suffix (CDN size tag)
+/// and any query string before checking the extension.
+fn is_svg_asset(url: &str) -> bool {
+    let base = url.split(['?', '@']).next().unwrap_or(url);
+    base.ends_with(".svg")
 }
 
 /// Extract the `salt` string MuseScore feeds into the per-page jmuse token
@@ -1559,23 +1767,18 @@ fn strip_highlight_markers(s: &str) -> String {
     s.replace("[b]", "").replace("[/b]", "")
 }
 
-/// Mint the 4-character jmuse auth token for every page index `0..count`.
-/// The token is the first 4 hex chars of `md5(id + type + index + salt)` —
-/// MuseScore's bundle computes exactly this, as confirmed by the
-/// musescore-downloader / yt-dlp / amuse implementations. We compute it
-/// natively instead of running their (frequently-changing, minified) JS
-/// bundle through a JS engine: faster, and immune to bundle syntax churn
-/// that used to break token minting on every MuseScore deploy.
-fn mint_tokens(salt: &str, score_id: &str, media_type: &str, count: usize) -> Vec<String> {
+/// Mint the 4-character jmuse auth token for a single page index: the first 4
+/// hex chars of `md5(id + type + index + salt)`, lowercase. MuseScore's bundle
+/// computes exactly this (confirmed against musescore-downloader / dl-librescore
+/// / yt-dlp / amuse), so we compute it natively instead of running their
+/// frequently-changing minified JS through a JS engine — faster, and immune to
+/// bundle syntax churn that used to break token minting on every deploy.
+fn mint_token(salt: &str, score_id: &str, media_type: &str, index: usize) -> String {
     use md5::{Digest, Md5};
-    (0..count)
-        .map(|index| {
-            let input = format!("{score_id}{media_type}{index}{salt}");
-            let digest = Md5::digest(input.as_bytes());
-            // First 4 hex chars of the digest == first 2 bytes as lowercase hex.
-            format!("{:02x}{:02x}", digest[0], digest[1])
-        })
-        .collect()
+    let input = format!("{score_id}{media_type}{index}{salt}");
+    let digest = Md5::digest(input.as_bytes());
+    // First 4 hex chars of the digest == first 2 bytes as lowercase hex.
+    format!("{:02x}{:02x}", digest[0], digest[1])
 }
 
 /// Stitch a Vec of PNG byte buffers into a single PDF document, one page
@@ -1614,39 +1817,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bundle_pattern_matches_score_bundle() {
-        assert!(matches_bundle_pattern(
-            "https://musescore.com/static/public/build/musescore_es6/202605/2946.39bf11a4f5f177d8d4f4d5c31f8d973e.js"
+    fn bundle_urls_collects_all_candidates() {
+        // Two app bundles (numeric-head and named) plus a decoy under a
+        // non-musescore build path. dl-librescore's shape accepts the first
+        // two and we now try both for the salt; the decoy is rejected.
+        let html = r#"
+            <link rel="preload" as="script" href="https://musescore.com/static/public/build/musescore_es6/202605/2946.39bf11a4f5f177d8d4f4d5c31f8d973e.js">
+            <link rel="preload" as="script" href="https://musescore.com/static/public/build/musescore_es6/202605/ms.8161d273ff40c7bcaf29ff0743fbc076.js">
+            <link rel="preload" as="script" href="https://musescore.com/static/public/build/vendor/deadbeef.js">
+        "#;
+        let urls = extract_bundle_urls(html);
+        assert_eq!(urls.len(), 2, "got {urls:?}");
+        assert!(urls[0].ends_with("2946.39bf11a4f5f177d8d4f4d5c31f8d973e.js"));
+        assert!(urls[1].ends_with("ms.8161d273ff40c7bcaf29ff0743fbc076.js"));
+
+        // Individual predicate: `musescore*/20*/….js` accepted; a numeric head
+        // is no longer required (that was the too-strict old rule).
+        assert!(is_bundle_candidate(
+            "https://musescore.com/static/public/build/musescore_es6/202605/ms.abc.js"
         ));
-        // ms.<hash>.js — head segment must be digits
-        assert!(!matches_bundle_pattern(
-            "https://musescore.com/static/public/build/musescore_es6/202605/ms.8161d273ff40c7bcaf29ff0743fbc076.js"
+        assert!(!is_bundle_candidate(
+            "https://musescore.com/static/public/build/vendor/deadbeef.js"
         ));
-        // vendor.<hash>.js
-        assert!(!matches_bundle_pattern(
-            "https://musescore.com/static/public/build/musescore_es6/202605/vendor.05a258a5192adf06a493aca23bbc02ab.js"
+        // Not a .js
+        assert!(!is_bundle_candidate(
+            "https://musescore.com/static/public/build/musescore_es6/202605/app.css"
         ));
     }
 
     #[test]
-    fn mint_tokens_native_md5() {
+    fn mint_token_native_md5() {
         // Token = first 4 hex chars of md5(score_id + type + index + salt),
         // lowercase. With all-empty score_id/type/salt the per-index input is
         // just the index digit, so we can pin against well-known MD5 vectors:
         //   md5("0") = cfcd208495d565ef66e7dff9f98764da
         //   md5("1") = c4ca4238a0b923820dcc509a6f75849b
-        let tokens = mint_tokens("", "", "", 2);
-        assert_eq!(tokens, vec!["cfcd".to_string(), "c4ca".to_string()]);
+        assert_eq!(mint_token("", "", "", 0), "cfcd");
+        assert_eq!(mint_token("", "", "", 1), "c4ca");
 
-        // Shape check for a realistic call: salt="xy", score_id="img",
-        // media_type="42" → index 0 hashes "img420xy". Just assert the token
-        // is 4 lowercase hex chars (the exact value isn't a known vector).
-        let one = mint_tokens("xy", "img", "42", 1);
-        assert_eq!(one.len(), 1);
-        assert_eq!(one[0].len(), 4);
-        assert!(one[0]
+        // The dl-librescore fallback salt contains a comma — make sure it
+        // flows through the md5 input untouched (the token is just 4 lowercase
+        // hex chars; the exact value isn't a known vector).
+        let one = mint_token(FALLBACK_SALT, "123456", "img", 3);
+        assert_eq!(one.len(), 4);
+        assert!(one
             .chars()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    }
+
+    #[test]
+    fn svg_asset_detection() {
+        assert!(is_svg_asset(
+            "https://musescore.com/static/.../score_0.svg"
+        ));
+        assert!(is_svg_asset(
+            "https://example.com/score_0.svg@0"
+        ));
+        assert!(!is_svg_asset(
+            "https://musescore.com/static/.../score_0.png@0"
+        ));
+        assert!(!is_svg_asset("https://example.com/score_0.png?foo=bar"));
+    }
+
+    #[test]
+    fn first_page_url_from_preload_link() {
+        // Preferred: the preload <link as="image">, with the @<size> tag
+        // stripped so page 0 matches the jmuse pages' resolution.
+        let html = r#"<link rel="preload" href="https://musescore.com/static/x/score_0.png@0" as="image">"#;
+        assert_eq!(
+            extract_first_page_url(html).as_deref(),
+            Some("https://musescore.com/static/x/score_0.png")
+        );
+        // Fallback: first <img src*="score_0"> when no preload link exists.
+        // SVG has no @-tag, so it passes through unchanged.
+        let html2 = r#"<div><img src="https://cdn/score_0.svg" alt="p1"></div>"#;
+        assert_eq!(
+            extract_first_page_url(html2).as_deref(),
+            Some("https://cdn/score_0.svg")
+        );
+        // Neither present.
+        assert_eq!(extract_first_page_url("<html></html>"), None);
+    }
+
+    #[test]
+    fn pages_count_regex_fallback() {
+        // Escaped-JSON form inside a data attribute.
+        assert_eq!(find_pages_count_regex(r#"...&quot;pages&quot;:12,..."#), Some(12));
+        // Plain-JSON form.
+        assert_eq!(find_pages_count_regex(r#"{"pages":3,"foo":1}"#), Some(3));
+        // Absent.
+        assert_eq!(find_pages_count_regex("nothing here"), None);
     }
 
     #[test]
@@ -1702,22 +1962,15 @@ mod tests {
     async fn musescore_smoke_search_and_fetch_pdf() {
         let _ = tracing_subscriber::fmt().with_test_writer().try_init();
 
-        // MuseScore.com sits behind Cloudflare's bot challenge now; direct
-        // fetches return HTTP 403 with the "Just a moment…" interstitial.
-        // The whole pipeline only works when FLARESOLVERR_URL is set so the
-        // CF-challenged pages route through a real browser. The GitHub
-        // Actions runner doesn't have FS provisioned, so skip there rather
-        // than fail loudly — the test is still runnable locally / on the
-        // NAS where FS lives. To run the smoke against FS in CI, add a
-        // service container to .github/workflows/release.yml.
-        if std::env::var("FLARESOLVERR_URL").ok().filter(|s| !s.is_empty()).is_none() {
-            eprintln!(
-                "musescore_smoke: FLARESOLVERR_URL not set, skipping; \
-                 see comment for how to enable in CI"
-            );
-            return;
-        }
-
+        // The pipeline is direct-first (dl-librescore's method): from a
+        // residential egress the direct fetch succeeds and no FlareSolverr is
+        // needed, so this test runs unconditionally now. It only requires FS
+        // when the host running it *is* Cloudflare-challenged (e.g. a data-
+        // center IP). The GitHub Actions runner is such an IP and has no FS,
+        // so there the direct fetch 403s and this test fails — the CI
+        // `musescore-smoke` job runs it with `continue-on-error: true` so that
+        // never blocks a deploy. Run it on the NAS (residential IP) to get a
+        // real pass, with or without FLARESOLVERR_URL set.
         let m = Musescore::new().expect("Musescore::new");
 
         let query =
