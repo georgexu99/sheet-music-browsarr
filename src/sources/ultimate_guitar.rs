@@ -237,8 +237,8 @@ impl UltimateGuitar {
         }
     }
 
-    /// Direct cookie-replay fast path; see MuseScore's `try_direct_clearance`
-    /// for the rationale. Returns `Some` only on a clean 200 that isn't a CF
+    /// Direct cookie-replay fast path; see MuseScore's `try_direct` for the
+    /// rationale. Returns `Some` only on a clean 200 that isn't a CF
     /// interstitial; any failure returns `None` so the caller falls back.
     async fn try_direct_clearance(&self, url: &str, ctx_label: &'static str) -> Option<String> {
         let ua = self.fs_ua.lock().await.clone()?;
