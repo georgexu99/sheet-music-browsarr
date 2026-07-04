@@ -129,6 +129,16 @@ a `/search?q=` endpoint to the worker that returns the rendered results HTML/JSO
 or (ii) get the search HTML from the nodriver solver (8193) and lean on the DOM
 fallback. Lower priority than the PDF path.
 
+### 5c-note. Search vs PDF are already decoupled (important UX point)
+`Source::search` returns metadata ONLY (title, composer, thumbnail, "N pages"
+badge, difficulty). `fetch_pdf_bytes` (the ~160 s worker) runs ONLY on the
+"Open PDF" click (`/pdf/musescore/{id}`), and also `/email` + `/admin/library/add`.
+So the worker slowness CANNOT slow search — result cards render instantly once
+5c lands. The 160 s is purely the click-to-download wait. Make that wait pleasant:
+speed (5d) + PDF cache + a progress/spinner page instead of a blocking request +
+route slow scores through the existing **"Email me this PDF"** flow (async
+generate → email; user never blocks). Don't pre-generate PDFs at search time.
+
 ### 5d. Speed
 ~160 s/score now (Chrome cold-start + conservative 6-pass harvest). Tune: reuse a
 warm browser+tab, fewer passes, larger steps, stop as soon as `pages_count`
