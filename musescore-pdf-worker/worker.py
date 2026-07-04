@@ -173,7 +173,15 @@ class Worker:
     async def get_browser(self):
         if self.browser is None:
             win = os.environ.get("WINDOW", "1500,1000")
-            self.browser = await uc.start(headless=False, browser_args=[f"--window-size={win}"])
+            args = [f"--window-size={win}"]
+            # In Docker we run headful Chrome as root under Xvfb; Chrome refuses
+            # the sandbox as root, and /dev/shm is tiny in a default container.
+            # CHROME_EXTRA_ARGS lets the image inject
+            # `--no-sandbox --disable-dev-shm-usage` without changing the
+            # desktop-tested path (var unset => identical to before).
+            extra = os.environ.get("CHROME_EXTRA_ARGS", "").split()
+            args.extend(extra)
+            self.browser = await uc.start(headless=False, browser_args=args)
         return self.browser
 
     async def handle_pdf(self, request: web.Request) -> web.Response:

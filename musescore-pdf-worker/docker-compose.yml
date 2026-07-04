@@ -1,0 +1,41 @@
+# Portainer stack for the MuseScore PDF worker.
+#
+# Deploy as a new stack named `musescore-pdf-worker` on the NAS (host 10.0.0.91).
+# Publishes 8194 (8191/8192/8193 are the existing solver test stacks). The Rust
+# app reaches it via MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194.
+#
+# The image is built + pushed to GHCR by
+# .github/workflows/musescore-pdf-worker.yml (same pattern as the main app),
+# so the Portainer stack just pulls it — no build context needed on the NAS.
+# To build locally instead (needs a working Docker/Linux engine), comment out
+# `image:` and uncomment `build: .`.
+#
+# Smoke test after deploy:
+#   curl -s -o t.pdf http://10.0.0.91:8194/pdf/5739597 && file t.pdf   # ~2 MB %PDF
+services:
+  musescore-pdf-worker:
+    image: ghcr.io/georgexu99/musescore-pdf-worker:latest
+    # build: .
+    container_name: musescore-pdf-worker
+    restart: unless-stopped
+    ports:
+      - "8194:8194"
+    # Chrome renders large score pages; the default 64 MB /dev/shm is not
+    # enough even with --disable-dev-shm-usage as a fallback.
+    shm_size: "2gb"
+    environment:
+      PORT: "8194"
+      CHROME_EXTRA_ARGS: "--no-sandbox --disable-dev-shm-usage"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8194')+'/healthz').read()"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          # Serialized single-Chrome design (one asyncio.Lock) => 1 CPU is
+          # plenty; cap memory so a runaway Chrome can't starve the NAS. Bump
+          # if the container gets OOM-killed on very large scores.
+          memory: 2g

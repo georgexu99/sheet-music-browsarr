@@ -1,7 +1,28 @@
 # MuseScore PDF worker — handoff / resume doc
 
-**Status (2026-07-04): core proven & committed. Remaining work = deployment.**
+**Status (2026-07-04): core proven, containerized, and Rust-wired. Remaining
+work = the actual NAS deploy + search parser + speed.**
 This doc is self-contained so you can `/clear` and resume from here.
+
+**Progress this session:**
+- **5a Dockerfile — WRITTEN + re-verified.** `Dockerfile`, `docker-compose.yml`
+  (pulls the GHCR image), and CI (`.github/workflows/musescore-pdf-worker.yml`,
+  builds→`ghcr.io/georgexu99/musescore-pdf-worker:latest`) are done. `worker.py`
+  gained a `CHROME_EXTRA_ARGS` hook so the image can inject
+  `--no-sandbox --disable-dev-shm-usage` (root Chrome under Xvfb) without
+  touching the desktop path. Re-ran `worker.py` on the desktop → `/pdf/5739597`
+  = **HTTP 200, 2,050,312 bytes, 7-page %PDF**. ✅
+  **STILL UNVERIFIED: does Xvfb-in-Docker clear the Turnstile?** Local Docker is
+  dead on the dev box (no WSL2 → Docker Desktop won't start), so the container
+  couldn't be built/run here. This gets verified on the NAS at deploy time
+  (smoke test below). The desktop egress == the NAS egress (same residential
+  WAN), so the only untested variable is the Xvfb layer, not the IP.
+- **5b Rust wiring — DONE.** `src/sources/musescore.rs`: new
+  `MUSESCORE_PDF_WORKER_URL` env + `fetch_pdf_via_worker()`; `fetch_pdf_bytes`
+  delegates to the worker when the env is set, streams the PDF under `max_bytes`,
+  and returns `Err` on 4xx/5xx/timeout/non-PDF → `pdf_handler` 302s to the score
+  page (link-out preserved). Legacy jmuse/bundle/salt pipeline kept as the
+  unset-env fallback. `cargo check` clean; 7 musescore unit tests pass.
 
 ---
 
@@ -95,27 +116,31 @@ what lets Chrome pass the challenge. The NAS is a TerraMaster F4-424 (see
 
 ## 5. Next steps
 
-### 5a. Dockerfile (the one real remaining risk)
-Package `worker.py` in a container with Python + Google Chrome + nodriver + Xvfb
-(headful Chrome under a virtual display). **Risk to verify first:** does nodriver
-clear the Turnstile from *inside Docker/Xvfb*? Desktop headful works; the old
-`21hsmw/flaresolverr:nodriver` image (nodriver in Docker) DID pass, so base the
-Dockerfile on a similar pattern (or start `FROM` a maintained
-python+chrome+xvfb image). Entrypoint: `xvfb-run -a python worker.py` (or start
-Xvfb + `DISPLAY=:99`). Expose `PORT` (suggest **8194** — 8191/8192/8193 taken).
-Give it `shm_size: 2gb`. Deploy as a new Portainer stack `musescore-pdf-worker`,
-publish `8194:8194`. Smoke test: `curl http://10.0.0.91:8194/pdf/5739597 -o t.pdf`
-should be `%PDF` and ~2 MB.
+### 5a. Dockerfile — DONE (build/run verification pending on NAS)
+Files written: `Dockerfile` (python:3.12-slim + google-chrome-stable + Xvfb +
+fonts + dumb-init; entrypoint `dumb-init -- xvfb-run -a -s "-screen 0
+1920x2400x24" python worker.py`; `EXPOSE 8194`), `docker-compose.yml` (Portainer
+stack, pulls the GHCR image, `shm_size: 2gb`, mem-limit 2 g, healthcheck), and CI
+`.github/workflows/musescore-pdf-worker.yml`. **The one remaining risk is still
+open:** does Xvfb-in-Docker clear the Turnstile? Couldn't build locally (no WSL2).
+**Verify at deploy:** on the NAS, `curl http://10.0.0.91:8194/pdf/5739597 -o t.pdf`
+must be `%PDF` and ~2 MB. If it 422s / times out, the Xvfb Chrome isn't passing —
+compare with the proven `21hsmw/flaresolverr:nodriver` flags before deep-diving.
 
-### 5b. Wire Rust `fetch_pdf_bytes`
-In `src/sources/musescore.rs`, replace the jmuse/bundle/salt PDF pipeline for the
-download path with a call to the worker: `GET {WORKER_URL}/pdf/{id}` (new env
-`MUSESCORE_PDF_WORKER_URL`, e.g. `http://10.0.0.91:8194`), return the PDF bytes
-directly (respect `max_bytes`). On worker 422/5xx or unset URL → keep the current
-behavior (fall back to `external_url` link-out). The `pdf_handler` in
-`src/routes/public.rs` already 302s to `external_url` on `Err`, so returning an
-error preserves the link-out. Keep the boa/jmuse code or delete it — it no longer
-works against current MuseScore (search page dropped the `data-hex` hydration).
+**Deploy path (mirrors the app):** push branch→main → CI builds+pushes
+`ghcr.io/georgexu99/musescore-pdf-worker:latest` → create Portainer stack
+`musescore-pdf-worker` from `musescore-pdf-worker/docker-compose.yml` (publishes
+`8194:8194`). No build context needed on the NAS — the stack just pulls the image.
+
+### 5b. Wire Rust `fetch_pdf_bytes` — DONE
+`src/sources/musescore.rs`: `PDF_WORKER_ENV = "MUSESCORE_PDF_WORKER_URL"`, new
+`fetch_pdf_via_worker()` (300 s per-request timeout override, streams the PDF
+under `max_bytes`, `%PDF-` sniff, non-2xx → `Err`). `fetch_pdf_bytes` early-
+returns through the worker when the env is set; otherwise falls through to the
+legacy jmuse pipeline (kept, not deleted — harmless, and it's the no-worker
+fallback). `pdf_handler` already 302s to `external_url` on `Err`, so 422/5xx/
+timeout all preserve the link-out. **To activate: set
+`MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194` on app stack 7 + redeploy.**
 
 ### 5c. MuseScore search parser (separate from PDF)
 Current search is degraded/skipped. MuseScore dropped the `data-<hex>` SSR
@@ -139,11 +164,23 @@ speed (5d) + PDF cache + a progress/spinner page instead of a blocking request +
 route slow scores through the existing **"Email me this PDF"** flow (async
 generate → email; user never blocks). Don't pre-generate PDFs at search time.
 
-### 5d. Speed
+### 5d. Speed + concurrency (known limitation)
 ~160 s/score now (Chrome cold-start + conservative 6-pass harvest). Tune: reuse a
 warm browser+tab, fewer passes, larger steps, stop as soon as `pages_count`
 captured. Target < 60 s. Consider a disk PDF cache keyed by score id (the app has
 a cache-dir pattern already; see `docs/plan.md` Phase F).
+
+**Concurrency ceiling (flagged in adversarial review):** the worker serializes
+every request behind one `asyncio.Lock` held for the whole ~160–240 s harvest
+(one shared Chrome). The Rust client's 300 s timeout starts when the request is
+*sent*, so a second `/pdf` queued behind a long harvest can burn most of its
+budget just waiting and then time out → link-out, even though it was never
+processed. Throughput is ~1 PDF / ~4 min; the admin "add to library" path and a
+concurrent public click can collide. Degrades to a graceful link-out (not a
+crash), but it's why bursts will show intermittent MuseScore failures. Real fix
+lands with 5d/5c-note: a PDF cache (dedupes repeat clicks) + routing slow/queued
+scores through the async **"Email me this PDF"** flow so users never block on the
+lock. A warm-tab pool (N Chromes) would raise the ceiling if needed.
 
 ### 5e. Cleanup
 Once the worker is the MuseScore path: tear down the `byparr` (8192) and
@@ -154,10 +191,14 @@ HTML). Repoint stack 7 off `FLARESOLVERR_URL` if no longer used by MuseScore
 ---
 
 ## 6. Quick resume checklist
-- [ ] Write `musescore-pdf-worker/Dockerfile`; build/deploy stack on **8194**;
-      `curl .../pdf/5739597` returns a real PDF (proves Xvfb challenge-pass).
-- [ ] Rust: `fetch_pdf_bytes` → worker; env `MUSESCORE_PDF_WORKER_URL`; 422→link-out.
-- [ ] Deploy app; click "Open PDF" on a free MuseScore result → real PDF.
+- [x] Write `musescore-pdf-worker/Dockerfile` (+ compose + CI). worker.py
+      `CHROME_EXTRA_ARGS` hook added; desktop re-verified (2 MB 7-page PDF).
+- [x] Rust: `fetch_pdf_bytes` → worker; env `MUSESCORE_PDF_WORKER_URL`;
+      422/5xx/timeout → link-out. `cargo check` + unit tests pass.
+- [ ] **Deploy worker stack on 8194**; `curl .../pdf/5739597` returns a real PDF
+      (this is what proves Xvfb-in-Docker clears the Turnstile — still untested).
+- [ ] Set `MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194` on app stack 7,
+      redeploy; click "Open PDF" on a free MuseScore result → real PDF.
 - [ ] Fix search parser (5c); un-skip MuseScore in search.
 - [ ] Optimize speed; add PDF cache.
 - [ ] Tear down test stacks.

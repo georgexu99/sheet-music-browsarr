@@ -1,0 +1,57 @@
+name: Build musescore-pdf-worker
+
+# The PDF worker is a separate image from the main app (Python + headless
+# Chrome, not the Rust binary), so it gets its own workflow. Path-filtered so
+# an app-only change doesn't rebuild the ~1 GB Chrome image, and vice-versa.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'musescore-pdf-worker/**'
+      - '.github/workflows/musescore-pdf-worker.yml'
+  pull_request:
+    paths:
+      - 'musescore-pdf-worker/**'
+      - '.github/workflows/musescore-pdf-worker.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/musescore-pdf-worker
+          tags: |
+            type=ref,event=branch
+            type=sha,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: musescore-pdf-worker
+          push: ${{ github.event_name != 'pull_request' }}
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

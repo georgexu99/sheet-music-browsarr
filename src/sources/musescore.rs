@@ -36,6 +36,23 @@ const FLARESOLVERR_ENV: &str = "FLARESOLVERR_URL";
 const FLARESOLVERR_POOL_ENV: &str = "FLARESOLVERR_POOL_SIZE";
 const FLARESOLVERR_POOL_DEFAULT: usize = 3;
 
+/// Env var pointing at the MuseScore PDF worker (see `musescore-pdf-worker/`).
+/// The worker drives a real headless Chrome that clears Cloudflare and
+/// screenshots each rendered page — the only method that still works against
+/// current MuseScore, since the CDN page images are fingerprint-walled to a
+/// passing Chrome (the jmuse/bundle/salt pipeline below is effectively dead).
+/// When set (e.g. `http://10.0.0.91:8194`), `fetch_pdf_bytes` delegates to it.
+/// When unset, we fall through to the legacy direct pipeline (which now
+/// generally fails → the caller link-outs to the score page).
+const PDF_WORKER_ENV: &str = "MUSESCORE_PDF_WORKER_URL";
+
+/// Wall-clock ceiling for one worker `GET /pdf/<id>` call. The worker itself
+/// caps a harvest at 240 s and returns 504 past that; we allow a little more so
+/// the worker's own structured error (422 paywalled / 504 timeout) reaches us
+/// instead of the reqwest client aborting first. A hung worker still can't wedge
+/// a request forever.
+const PDF_WORKER_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How often the background task destroys + recreates every session in
 /// the pool. FlareSolverr's bundled Chromium has a slow memory leak
 /// over days of uptime; recycling daily keeps each browser fresh
@@ -197,6 +214,11 @@ pub struct Musescore {
     /// or 0 if none yet. Read by the keep-warm loop to decide whether the
     /// instance is active enough to justify a background re-solve.
     last_activity: AtomicI64,
+    /// Base URL of the external PDF worker (`MUSESCORE_PDF_WORKER_URL`), e.g.
+    /// `http://10.0.0.91:8194`. `Some(_)` => `fetch_pdf_bytes` delegates the
+    /// whole download to the worker; `None` => legacy direct pipeline. Trailing
+    /// slashes are trimmed at construction so we can `format!("{base}/pdf/…")`.
+    pdf_worker_url: Option<String>,
 }
 
 struct CachedAlgorithm {
@@ -268,6 +290,20 @@ impl Musescore {
             Vec::new()
         };
 
+        let pdf_worker_url = std::env::var(PDF_WORKER_ENV)
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty());
+        match pdf_worker_url.as_deref() {
+            Some(url) => tracing::info!(
+                worker = %url,
+                "MuseScore: PDF downloads route through the headless-Chrome worker"
+            ),
+            None => tracing::debug!(
+                "MuseScore: MUSESCORE_PDF_WORKER_URL unset; using legacy direct PDF pipeline"
+            ),
+        }
+
         Ok(Self {
             http,
             jar,
@@ -278,6 +314,7 @@ impl Musescore {
             fs_solve_lock: Mutex::new(()),
             cached: Mutex::new(None),
             last_activity: AtomicI64::new(0),
+            pdf_worker_url,
         })
     }
 
@@ -864,6 +901,77 @@ impl Musescore {
         Ok(buf)
     }
 
+    /// Delegate the whole PDF download to the external headless-Chrome worker
+    /// (`MUSESCORE_PDF_WORKER_URL`). The worker clears Cloudflare, screenshots
+    /// each rendered page, and returns a stitched `application/pdf`, which we
+    /// stream back under the `max_bytes` cap. Any non-2xx — 422
+    /// (paywalled / unharvestable), 504 (worker's own harvest timeout), or 5xx
+    /// (worker error) — becomes an `Err`, which `pdf_handler` turns into a
+    /// graceful 302 link-out to the score page.
+    async fn fetch_pdf_via_worker(
+        &self,
+        worker_base: &str,
+        id: &str,
+        max_bytes: usize,
+    ) -> anyhow::Result<Vec<u8>> {
+        let url = format!("{worker_base}/pdf/{id}");
+        tracing::info!(id, worker = %worker_base, "musescore: requesting PDF from worker");
+
+        // Per-request timeout override: the shared Client's default is 20 s,
+        // far shorter than a Chrome harvest. `.timeout()` on the builder wins.
+        let resp = self
+            .http
+            .get(&url)
+            .timeout(PDF_WORKER_TIMEOUT)
+            .send()
+            .await
+            .with_context(|| format!("musescore pdf worker request {url}"))?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            // The worker returns a small JSON `{"error": "..."}` on 4xx/5xx.
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "musescore pdf worker {url} returned HTTP {status}: {}",
+                truncate_for_log(&body, 300)
+            );
+        }
+
+        // Enforce the same aggregate cap as the direct pipeline so a
+        // pathologically large PDF can't blow the response budget.
+        if let Some(len) = resp.content_length() {
+            anyhow::ensure!(
+                (len as usize) <= max_bytes,
+                "musescore worker PDF too large ({len} > {max_bytes})"
+            );
+        }
+        let mut buf = Vec::with_capacity(256 * 1024);
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("musescore pdf worker body stream")?;
+            if buf.len() + chunk.len() > max_bytes {
+                anyhow::bail!("musescore worker PDF exceeds {max_bytes} bytes during streaming");
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        // Defend against a 200 that isn't actually a PDF (an HTML error page
+        // from a proxy, an empty body). A real PDF begins with `%PDF-`. Build
+        // the lossy debug string only on the failure branch — on the success
+        // path `buf` is a multi-MB binary blob and a full lossy copy would be
+        // pure waste.
+        if !buf.starts_with(b"%PDF-") {
+            let head = String::from_utf8_lossy(&buf[..buf.len().min(64)]);
+            anyhow::bail!(
+                "musescore worker returned non-PDF body ({} bytes, head {:?})",
+                buf.len(),
+                truncate_for_log(&head, 40)
+            );
+        }
+        tracing::info!(id, bytes = buf.len(), "musescore: worker PDF received");
+        Ok(buf)
+    }
+
     /// Resolve a single page's CDN image URL through `/api/jmuse`. Tries the
     /// candidate salts in priority order (bundle-extracted first, then
     /// [`FALLBACK_SALT`]) until the server accepts one, and records the
@@ -1051,6 +1159,16 @@ impl Source for Musescore {
 
     async fn fetch_pdf_bytes(&self, id: &str, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
         self.mark_activity();
+
+        // Preferred path: the headless-Chrome worker. It's the only method that
+        // still yields the page images (they're fingerprint-walled to a passing
+        // Chrome). On any worker error we return Err, and the caller
+        // (`pdf_handler`) 302s to the score page — the same graceful link-out
+        // the legacy pipeline's failure produced.
+        if let Some(worker) = self.pdf_worker_url.as_deref() {
+            return self.fetch_pdf_via_worker(worker, id, max_bytes).await;
+        }
+
         let page = self.fetch_score_page(id).await?;
         // UA the score page (and therefore the fresh cf_clearance cookie) was
         // just solved under. Replay it on the direct bundle/jmuse/CDN calls so
