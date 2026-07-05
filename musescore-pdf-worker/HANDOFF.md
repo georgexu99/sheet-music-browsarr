@@ -1,10 +1,72 @@
 # MuseScore PDF worker — handoff / resume doc
 
-**Status (2026-07-04): core proven, containerized, and Rust-wired. Remaining
-work = the actual NAS deploy + search parser + speed.**
+**Status (2026-07-05): DEPLOYED to the NAS. Container is healthy and — the big
+one — Chrome-under-Xvfb-in-Docker CLEARS the Cloudflare Turnstile. One blocker
+left: the screenshot-capture phase hangs in-container (works on desktop).**
 This doc is self-contained so you can `/clear` and resume from here.
 
-**Progress this session:**
+## ⭐ 2026-07-05 deployment session — READ THIS FIRST
+
+**Worker is live on the NAS:** Portainer stack `musescore-pdf-worker` (stack
+**id=13**, endpoint 3), publishes **8194**, pulls
+`ghcr.io/georgexu99/musescore-pdf-worker:latest` (a **public** GHCR package). CI
+(`.github/workflows/musescore-pdf-worker.yml`) builds+pushes it on every push to
+`main`. Branch merged to main; main HEAD ≈ `4bc02d0`.
+
+**✅ CORE RISK RETIRED:** container logs on a real `/pdf/5739597` request show:
+```
+[worker] starting Chrome
+[worker] Chrome started
+[worker] score 5739597: navigating to score page
+[worker] score 5739597: challenge cleared, pages_count=7
+```
+So **Xvfb + headful Chrome in Docker passes the Turnstile** and reads the score.
+This was the whole project's open question. Answered: yes.
+
+**🚧 BLOCKER (next task): the harvest hangs right after clearing the challenge.**
+The log stops at `challenge cleared` and never reaches
+`main hash … found; starting capture passes`. So it hangs in the ~3 lines
+between: `cdp.emulation.set_device_metrics_override(...)` (the 1400×2200@2x
+emulated viewport) **or** the warm-up `STEP_JS` `tab.evaluate` loop. On desktop
+these return fine; under Xvfb one of them blocks, the outer `HARVEST_TIMEOUT`
+(420 s on the NAS) eventually fires → 504, and `reset_browser()` recycles Chrome.
+**Hypotheses (most→least likely):** (1) `set_device_metrics_override` with
+`device_scale_factor=2` hangs Chrome's compositor on the virtual display — try
+`device_scale_factor=1` (bump VP_W/VP_H to compensate) or drop the emulation and
+size via `--window-size`/`--force-device-scale-factor`; (2) a `tab.evaluate`
+CDP call hangs — wrap every `tab.send`/`tab.evaluate` in a short
+`asyncio.wait_for` so one stuck call can't freeze the whole harvest; (3) GPU/
+compositor: add `--disable-gpu --disable-software-rasterizer --use-gl=swiftshader`
+to `CHROME_EXTRA_ARGS`. **Iterate:** edit worker.py → push main → wait worker CI
+→ Portainer stack 13 "Redeploy from git repository / Pull and redeploy" (Update)
+→ `curl -m 480 http://10.0.0.91:8194/pdf/5739597` → read stack-13 container logs.
+The `log()` milestones + `PYTHONUNBUFFERED=1` make progress visible live.
+
+**Deploy gotchas already solved (don't rediscover):**
+- **`xauth`** is a *runtime* dep of `xvfb-run` and a *separate* Debian package
+  from `xvfb`. Missing → `xvfb-run: error: xauth command not found` → crash-loop.
+  A successful image *build* does NOT catch it. It's in the Dockerfile now.
+- **`pull_policy: always`** in the compose is mandatory: the image republishes
+  under `:latest`, and Portainer's "re-pull image" checkbox alone kept the stale
+  cached digest — the container ran the pre-fix image across two redeploys.
+- **GHCR tag propagation:** after a push, wait ~1 min before redeploying or the
+  NAS may pull the previous `:latest`.
+- **App auto-deploy webhook is BROKEN (404):** `release.yml`'s "Trigger Portainer
+  redeploy" step fails with `curl (22) 404` — the `PORTAINER_WEBHOOK_URL` secret
+  is stale/deleted. The app image (with the worker-wiring code) IS on GHCR
+  `:latest`, but the **live app was not redeployed** and still runs pre-worker
+  code. Fix the webhook (or redeploy stack 7 manually) as separate cleanup.
+
+**To fully activate "Open PDF → real PDF" once the harvest is fixed:**
+1. Redeploy app stack **7** (`sheet-music-browsarr`) to pull the new app image
+   (webhook is 404, so do it manually in Portainer / fix the webhook).
+2. Add env `MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194` to stack 7, redeploy.
+3. Note the slow harvest vs the Rust client timeout (`PDF_WORKER_TIMEOUT=300 s`
+   in `musescore.rs` vs `HARVEST_TIMEOUT=420 s`): the client will abort first on
+   slow scores. Route slow/large scores through the async "Email me this PDF"
+   flow (see §5c-note / §5d) rather than blocking the click.
+
+**Progress from the earlier (2026-07-04) session:**
 - **5a Dockerfile — WRITTEN + re-verified.** `Dockerfile`, `docker-compose.yml`
   (pulls the GHCR image), and CI (`.github/workflows/musescore-pdf-worker.yml`,
   builds→`ghcr.io/georgexu99/musescore-pdf-worker:latest`) are done. `worker.py`
@@ -195,10 +257,18 @@ HTML). Repoint stack 7 off `FLARESOLVERR_URL` if no longer used by MuseScore
       `CHROME_EXTRA_ARGS` hook added; desktop re-verified (2 MB 7-page PDF).
 - [x] Rust: `fetch_pdf_bytes` → worker; env `MUSESCORE_PDF_WORKER_URL`;
       422/5xx/timeout → link-out. `cargo check` + unit tests pass.
-- [ ] **Deploy worker stack on 8194**; `curl .../pdf/5739597` returns a real PDF
-      (this is what proves Xvfb-in-Docker clears the Turnstile — still untested).
+- [x] Merge to main; CI publishes `ghcr.io/georgexu99/musescore-pdf-worker:latest`.
+- [x] **Deploy worker stack on 8194** (Portainer stack id=13, pulls GHCR image).
+      Container healthy; `/healthz` = ok.
+- [x] **Proved Xvfb-in-Docker clears the Turnstile** (`challenge cleared,
+      pages_count=7` in the container logs). ⭐ core risk retired.
+- [ ] **FIX THE CAPTURE HANG** (top of doc): harvest stalls right after the
+      challenge clears (emulation/`set_device_metrics_override` or STEP_JS under
+      Xvfb). Then `curl .../pdf/5739597` should return a real ~2 MB %PDF.
+- [ ] Fix the app auto-deploy webhook (404) OR redeploy stack 7 manually so the
+      live app runs the worker-wiring code.
 - [ ] Set `MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194` on app stack 7,
       redeploy; click "Open PDF" on a free MuseScore result → real PDF.
 - [ ] Fix search parser (5c); un-skip MuseScore in search.
-- [ ] Optimize speed; add PDF cache.
-- [ ] Tear down test stacks.
+- [ ] Optimize speed; add PDF cache; route slow scores through the email flow.
+- [ ] Tear down test stacks (byparr 8192 / flaresolverr-nodriver 8193).
