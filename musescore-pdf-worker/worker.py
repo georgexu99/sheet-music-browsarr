@@ -38,6 +38,18 @@ VP_H = int(os.environ.get("VP_H", "2200"))
 VP_SCALE = int(os.environ.get("VP_SCALE", "2"))
 NAV_TIMEOUT = 60          # seconds to wait for the score page + challenge
 MAX_PAGES = 60            # sanity cap
+# Whole-harvest ceiling. Configurable because a weak host (e.g. the NAS N-series
+# CPU) renders + screenshots the score noticeably slower than a dev desktop
+# (~160 s there), so the desktop-era 240 s cap can trip mid-harvest. Env lets us
+# tune without a rebuild.
+HARVEST_TIMEOUT = int(os.environ.get("HARVEST_TIMEOUT", "360"))
+
+
+def log(msg: str):
+    """Print a flushed, timestamped-ish line so container logs show harvest
+    progress (Python buffers stdout when not a TTY; flush=True + PYTHONUNBUFFERED
+    in the image make these visible live)."""
+    print(f"[worker] {msg}", flush=True)
 
 STEP_JS = r"""(() => {
   const sc=document.querySelector('#jmuse-scroller-component');
@@ -94,12 +106,14 @@ async def harvest_pages(browser, score_id: str):
     Raises RuntimeError with a short reason on failure (challenge not cleared,
     no score data, paywalled, etc.).
     """
+    log(f"score {score_id}: navigating to score page")
     tab = await browser.get(f"https://musescore.com/score/{score_id}")
     try:
         pc = await _wait_for(tab, PAGES_JS)
         if not pc:
             raise RuntimeError("no score data (challenge not cleared or not a score)")
         pc = int(pc)
+        log(f"score {score_id}: challenge cleared, pages_count={pc}")
         if pc < 1 or pc > MAX_PAGES:
             raise RuntimeError(f"implausible pages_count={pc}")
 
@@ -121,6 +135,7 @@ async def harvest_pages(browser, score_id: str):
             await asyncio.sleep(0.3)
         if not mh:
             raise RuntimeError("no page images found")
+        log(f"score {score_id}: main hash {mh[:8]} found; starting capture passes")
 
         async def cap():
             try:
@@ -153,10 +168,12 @@ async def harvest_pages(browser, score_id: str):
                 await _ev(tab, "(()=>{const sc=document.querySelector('#jmuse-scroller-component');if(sc)sc.scrollTop+=240;window.scrollBy(0,180);return 1;})()")
                 await asyncio.sleep(0.32)
                 await cap()
+            log(f"score {score_id}: pass {_pass + 1}/6 done, captured {len(captured)}/{pc}")
 
         if len(captured) < pc:
             missing = [n for n in range(pc) if n not in captured]
             raise RuntimeError(f"captured {len(captured)}/{pc} pages; missing {missing}")
+        log(f"score {score_id}: all {pc} pages captured")
         return [captured[n] for n in range(pc)]
     finally:
         try:
@@ -181,8 +198,25 @@ class Worker:
             # desktop-tested path (var unset => identical to before).
             extra = os.environ.get("CHROME_EXTRA_ARGS", "").split()
             args.extend(extra)
+            log("starting Chrome")
             self.browser = await uc.start(headless=False, browser_args=args)
+            log("Chrome started")
         return self.browser
+
+    def reset_browser(self):
+        """Drop the shared browser so the next request starts a fresh one.
+        Called after a timeout or CDP/WebSocket error: a cancelled harvest (or a
+        dropped `no close frame` connection) leaves Chrome unusable, and every
+        later request would otherwise fail instantly on the dead connection.
+        `browser.stop()` is synchronous in nodriver."""
+        b = self.browser
+        self.browser = None
+        if b is not None:
+            try:
+                b.stop()
+            except Exception:
+                pass
+        log("browser reset (will relaunch on next request)")
 
     async def handle_pdf(self, request: web.Request) -> web.Response:
         score_id = request.match_info["score_id"]
@@ -191,14 +225,22 @@ class Worker:
         async with self.lock:
             try:
                 browser = await self.get_browser()
-                pages = await asyncio.wait_for(harvest_pages(browser, score_id), timeout=240)
+                pages = await asyncio.wait_for(
+                    harvest_pages(browser, score_id), timeout=HARVEST_TIMEOUT)
             except asyncio.TimeoutError:
+                log(f"score {score_id}: harvest timed out after {HARVEST_TIMEOUT}s")
+                self.reset_browser()
                 return web.json_response({"error": "harvest timed out"}, status=504)
             except RuntimeError as e:
                 # Expected "can't get this score" cases -> 422 so the caller can
-                # cleanly fall back to linking out.
+                # cleanly fall back to linking out. The browser is still healthy
+                # here (harvest raised cleanly), so keep it warm.
+                log(f"score {score_id}: unharvestable: {e}")
                 return web.json_response({"error": str(e)}, status=422)
             except Exception as e:
+                # Unexpected (often a dead CDP connection) -> rebuild the browser.
+                log(f"score {score_id}: worker error: {e}")
+                self.reset_browser()
                 return web.json_response({"error": f"worker error: {e}"}, status=500)
         try:
             pdf = img2pdf.convert(pages)

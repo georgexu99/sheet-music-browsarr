@@ -42,6 +42,9 @@ COPY worker.py .
 ENV CHROME_EXTRA_ARGS="--no-sandbox --disable-dev-shm-usage"
 ENV PORT=8194
 ENV WINDOW=1500,1000
+# Unbuffered stdout/stderr so `log()` lines show up live in `docker logs` /
+# Portainer instead of being held in Python's block buffer until exit.
+ENV PYTHONUNBUFFERED=1
 EXPOSE 8194
 
 # Give Xvfb a screen taller than the 1400x2200@2x emulated viewport so page

@@ -36,6 +36,11 @@ services:
     environment:
       PORT: "8194"
       CHROME_EXTRA_ARGS: "--no-sandbox --disable-dev-shm-usage"
+      # The TerraMaster CPU renders + screenshots slower than a dev desktop
+      # (~160 s there); give the harvest generous headroom so it isn't cut off
+      # mid-capture. The public "Open PDF" path should route slow scores through
+      # the async email flow rather than block a request this long (see HANDOFF).
+      HARVEST_TIMEOUT: "420"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,os; urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8194')+'/healthz').read()"]
       interval: 30s
