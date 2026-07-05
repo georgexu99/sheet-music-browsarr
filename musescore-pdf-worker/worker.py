@@ -43,6 +43,11 @@ MAX_PAGES = 60            # sanity cap
 # (~160 s there), so the desktop-era 240 s cap can trip mid-harvest. Env lets us
 # tune without a rebuild.
 HARVEST_TIMEOUT = int(os.environ.get("HARVEST_TIMEOUT", "360"))
+# Per-CDP-call ceiling. Any single Chrome round-trip (evaluate, screenshot,
+# emulation) that exceeds this is abandoned so the harvest keeps moving instead
+# of wedging until HARVEST_TIMEOUT. Generous enough not to abort a merely-slow
+# screenshot on the weak NAS CPU.
+CDP_CALL_TIMEOUT = int(os.environ.get("CDP_CALL_TIMEOUT", "20"))
 
 
 def log(msg: str):
@@ -117,29 +122,53 @@ async def harvest_pages(browser, score_id: str):
         if pc < 1 or pc > MAX_PAGES:
             raise RuntimeError(f"implausible pages_count={pc}")
 
-        await tab.send(cdp.emulation.set_device_metrics_override(
-            width=VP_W, height=VP_H, device_scale_factor=VP_SCALE, mobile=False))
+        # Each CDP round-trip is wrapped in a short wait_for: on the NAS one of
+        # these can hang indefinitely under Xvfb (a stuck compositor / dead CDP
+        # channel), which would otherwise freeze the whole harvest until the
+        # outer HARVEST_TIMEOUT. Timing one out lets the loop keep making
+        # progress and — critically — pinpoints WHICH call hangs in the logs.
+        log(f"score {score_id}: setting emulated viewport {VP_W}x{VP_H}@{VP_SCALE}x")
+        try:
+            await asyncio.wait_for(
+                tab.send(cdp.emulation.set_device_metrics_override(
+                    width=VP_W, height=VP_H, device_scale_factor=VP_SCALE, mobile=False)),
+                timeout=CDP_CALL_TIMEOUT)
+            log(f"score {score_id}: emulated viewport set")
+        except asyncio.TimeoutError:
+            log(f"score {score_id}: set_device_metrics_override HUNG ({CDP_CALL_TIMEOUT}s); continuing")
         await asyncio.sleep(1.0)
 
         captured: dict[int, bytes] = {}
         mh = ""
         # warm-up: one scroll so every page loads once and the main hash is known
-        for _ in range(60):
+        for i in range(60):
             try:
-                r = await _ejson(tab, STEP_JS)
+                r = await asyncio.wait_for(_ejson(tab, STEP_JS), timeout=CDP_CALL_TIMEOUT)
                 mh = r.get("mh") or mh
+                if i == 0:
+                    log(f"score {score_id}: warm-up ok, best={r.get('best', 0)} mh={(mh or '?')[:8]}")
                 if r.get("best", 0) >= pc:
                     break
-            except Exception:
-                pass
+            except asyncio.TimeoutError:
+                if i == 0:
+                    log(f"score {score_id}: warm-up STEP_JS HUNG ({CDP_CALL_TIMEOUT}s) on iter 0")
+            except Exception as e:
+                if i == 0:
+                    log(f"score {score_id}: warm-up iter 0 error: {e}")
             await asyncio.sleep(0.3)
         if not mh:
             raise RuntimeError("no page images found")
         log(f"score {score_id}: main hash {mh[:8]} found; starting capture passes")
 
+        async def scroll(js):
+            try:
+                await asyncio.wait_for(_ev(tab, js), timeout=CDP_CALL_TIMEOUT)
+            except Exception:
+                pass
+
         async def cap():
             try:
-                present = await _ejson(tab, present_js(mh))
+                present = await asyncio.wait_for(_ejson(tab, present_js(mh)), timeout=CDP_CALL_TIMEOUT)
             except Exception:
                 present = []
             for p in present:
@@ -148,8 +177,8 @@ async def harvest_pages(browser, score_id: str):
                     continue
                 vp = cdp.page.Viewport(x=p["x"], y=p["y"], width=p["w"], height=p["h"], scale=1.0)
                 try:
-                    data = await tab.send(cdp.page.capture_screenshot(
-                        format_="png", clip=vp, capture_beyond_viewport=False))
+                    data = await asyncio.wait_for(tab.send(cdp.page.capture_screenshot(
+                        format_="png", clip=vp, capture_beyond_viewport=False)), timeout=CDP_CALL_TIMEOUT)
                     raw = base64.b64decode(data)
                     if len(raw) > 3000:
                         captured[n] = raw
@@ -159,13 +188,13 @@ async def harvest_pages(browser, score_id: str):
         for _pass in range(6):
             if len(captured) >= pc:
                 break
-            await _ev(tab, "(()=>{const sc=document.querySelector('#jmuse-scroller-component');if(sc)sc.scrollTop=0;window.scrollTo(0,0);return 1;})()")
+            await scroll("(()=>{const sc=document.querySelector('#jmuse-scroller-component');if(sc)sc.scrollTop=0;window.scrollTo(0,0);return 1;})()")
             await asyncio.sleep(0.6)
             for _ in range(90):
                 await cap()
                 if len(captured) >= pc:
                     break
-                await _ev(tab, "(()=>{const sc=document.querySelector('#jmuse-scroller-component');if(sc)sc.scrollTop+=240;window.scrollBy(0,180);return 1;})()")
+                await scroll("(()=>{const sc=document.querySelector('#jmuse-scroller-component');if(sc)sc.scrollTop+=240;window.scrollBy(0,180);return 1;})()")
                 await asyncio.sleep(0.32)
                 await cap()
             log(f"score {score_id}: pass {_pass + 1}/6 done, captured {len(captured)}/{pc}")
