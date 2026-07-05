@@ -4,23 +4,23 @@
 # Publishes 8194 (8191/8192/8193 are the existing solver test stacks). The Rust
 # app reaches it via MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194.
 #
-# BUILD-ON-HOST mode (current): deploy this as a Portainer *Repository* stack
-# (Git) — Portainer clones the repo and builds the Dockerfile on the NAS from
-# `build: .`. No GHCR/registry needed. The `image:` line is just the local tag
-# for the built image.
+# GHCR/CI mode (current): the image is built + pushed to GHCR by
+# .github/workflows/musescore-pdf-worker.yml on merge to main. Deploy this as a
+# Portainer stack (web editor or a Repository stack tracking main) — Portainer
+# just PULLS the prebuilt image; no build happens on the NAS.
 #
-# GHCR/CI mode (production alternative): once
-# .github/workflows/musescore-pdf-worker.yml has pushed to GHCR (on merge to
-# main), swap the two lines below for
-# `image: ghcr.io/georgexu99/musescore-pdf-worker:latest` (drop `build: .`) so
-# Portainer just pulls the prebuilt image instead of building on the NAS.
+# BUILD-ON-HOST alternative: to build from source on the NAS instead (e.g. a
+# feature branch not yet on GHCR), replace `image:` below with
+# `image: musescore-pdf-worker:latest` + add `build: .`, and deploy as a
+# Portainer Repository stack pointing at that branch. (Tried during bring-up;
+# NAS builds this heavy Chrome image slowly and Portainer surfaces no build
+# logs, so the GHCR path above is preferred.)
 #
 # Smoke test after deploy:
 #   curl -s -o t.pdf http://10.0.0.91:8194/pdf/5739597 && file t.pdf   # ~2 MB %PDF
 services:
   musescore-pdf-worker:
-    build: .
-    image: musescore-pdf-worker:latest
+    image: ghcr.io/georgexu99/musescore-pdf-worker:latest
     container_name: musescore-pdf-worker
     restart: unless-stopped
     ports:
