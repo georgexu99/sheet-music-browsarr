@@ -21,6 +21,11 @@
 services:
   musescore-pdf-worker:
     image: ghcr.io/georgexu99/musescore-pdf-worker:latest
+    # The image is republished under the same :latest tag on every push, so a
+    # redeploy MUST re-pull to pick up a new build. Without this, docker compose
+    # keeps the locally-cached :latest and Portainer's "re-pull" checkbox alone
+    # proved unreliable for this git stack (it kept the stale digest).
+    pull_policy: always
     container_name: musescore-pdf-worker
     restart: unless-stopped
     ports:
