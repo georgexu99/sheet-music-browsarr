@@ -23,7 +23,13 @@ use std::sync::Arc;
 
 use super::AppState;
 
-const MAX_PDF_BYTES: usize = 10 * 1024 * 1024;
+// 25 MB, matching the admin path (`ADMIN_MAX_PDF_BYTES`). The MuseScore worker
+// screenshots pages at 1400×2200@2x and img2pdf embeds the PNGs without
+// recompression, so a long multi-page score lands well past 10 MB. At the old
+// cap those PDFs were discarded *after* the worker spent minutes in Chrome
+// producing them — the exact large scores the worker exists to serve. IMSLP /
+// Mutopia PDFs are well under this.
+const MAX_PDF_BYTES: usize = 25 * 1024 * 1024;
 /// How many results to ask each upstream source for, on page 1. Set to 20
 /// to match MuseScore's natural search-page size (their /sheetmusic page
 /// always renders 20 cards, capped by our scraper's `.take(limit)` — so
