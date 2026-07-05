@@ -13,11 +13,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   * google-chrome-stable — nodriver drives an installed Chrome (auto-detected
 #     at /usr/bin/google-chrome).
 #   * xvfb — virtual framebuffer so headful Chrome has a display.
+#   * xauth — REQUIRED by `xvfb-run` to create the X authority file; without it
+#     xvfb-run exits with "xauth command not found" and the container crash-loops
+#     (it's a separate Debian package from xvfb, and a runtime — not build — dep,
+#     so a successful image build doesn't catch its absence).
 #   * fonts-* — so rendered pages aren't tofu boxes (sheet music has text:
 #     titles, tempo marks, lyrics).
 #   * dumb-init — proper PID 1 so SIGTERM reaps Chrome's process tree cleanly.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget gnupg ca-certificates xvfb dumb-init \
+        wget gnupg ca-certificates xvfb xauth dumb-init \
         fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
     && wget -q -O /tmp/chrome.deb \
         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
