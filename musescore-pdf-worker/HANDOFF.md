@@ -23,24 +23,52 @@ This doc is self-contained so you can `/clear` and resume from here.
 So **Xvfb + headful Chrome in Docker passes the Turnstile** and reads the score.
 This was the whole project's open question. Answered: yes.
 
-**🚧 BLOCKER (next task): the harvest hangs right after clearing the challenge.**
-The log stops at `challenge cleared` and never reaches
-`main hash … found; starting capture passes`. So it hangs in the ~3 lines
-between: `cdp.emulation.set_device_metrics_override(...)` (the 1400×2200@2x
-emulated viewport) **or** the warm-up `STEP_JS` `tab.evaluate` loop. On desktop
-these return fine; under Xvfb one of them blocks, the outer `HARVEST_TIMEOUT`
-(420 s on the NAS) eventually fires → 504, and `reset_browser()` recycles Chrome.
-**Hypotheses (most→least likely):** (1) `set_device_metrics_override` with
-`device_scale_factor=2` hangs Chrome's compositor on the virtual display — try
-`device_scale_factor=1` (bump VP_W/VP_H to compensate) or drop the emulation and
-size via `--window-size`/`--force-device-scale-factor`; (2) a `tab.evaluate`
-CDP call hangs — wrap every `tab.send`/`tab.evaluate` in a short
-`asyncio.wait_for` so one stuck call can't freeze the whole harvest; (3) GPU/
-compositor: add `--disable-gpu --disable-software-rasterizer --use-gl=swiftshader`
-to `CHROME_EXTRA_ARGS`. **Iterate:** edit worker.py → push main → wait worker CI
-→ Portainer stack 13 "Redeploy from git repository / Pull and redeploy" (Update)
-→ `curl -m 480 http://10.0.0.91:8194/pdf/5739597` → read stack-13 container logs.
-The `log()` milestones + `PYTHONUNBUFFERED=1` make progress visible live.
+**🚧 BLOCKER (next task): only page 0 harvests — pages 1-6 never enter the DOM.**
+Fully diagnosed via in-container `DIAG_JS` logging (worker.py). The request now
+runs to completion and returns **422 `captured 1/7 pages; missing [1..6]`** (no
+longer a hang). The `DIAG[pre-warmup]` snapshot is the smoking gun:
+```
+scEx:true  scTop:0  scH:8913  docH:2200  winH:2200
+imgTotal:34  scoreImgs:10  scorePages:"0"  scoreLoaded:10
+```
+Read that as: the score-viewer scroll container **exists** and is **tall enough
+for all 7 pages** (scrollHeight 8913), page 0's images **load fine** (10/10
+decoded) — so it is **NOT** a Cloudflare/CDN fingerprint block and **NOT** a
+missing scroller. The problem is purely that **only `score_0` images are ever in
+the DOM** (`scorePages:"0"`); the viewer virtualizes and lazy-loads pages 1-6 as
+they scroll into view, and **that scroll-triggered lazy-load doesn't fire under
+Xvfb**. The harvest scrolls `#jmuse-scroller-component` but pages 1-6 never
+materialize, so `best` stays at 1 and only page 0 is captured. (Two earlier
+red-herrings are now RESOLVED: the "hang" was CDP slowness from
+`--disable-dev-shm-usage` — removed, CDP is ~0.0 s now; and neither the emulation
+nor the evaluate loop hangs.)
+
+**Prime hypothesis:** the viewer's lazy-load keys off `IntersectionObserver`,
+which doesn't fire reliably under the emulated viewport + Xvfb virtual display
+(programmatic `scrollTop` changes don't produce intersection callbacks).
+**Candidate fixes to try (each is one edit→push→CI→redeploy→test cycle):**
+1. **Check whether the scroll even advances** — the `DIAG[warmup-20/50]`
+   snapshots log `scTop` after scrolling. If `scTop` stays 0, the scroll isn't
+   moving (fix the scroll target/events); if `scTop` advances but `scorePages`
+   stays "0", it's the IntersectionObserver/lazy-load theory.
+2. **Make all pages visible at once so no lazy-load is needed:** set a very tall
+   emulated viewport (e.g. `VP_H`≈`scH`+margin at `VP_SCALE=1`, or size the Xvfb
+   screen + window tall) so all 7 pages are in-viewport → the viewer loads them
+   all → then screenshot each. Watch for OOM on an 8900px×2 surface.
+3. **Poke the lazy-load explicitly:** dispatch real `scroll`/`wheel` events on
+   `#jmuse-scroller-component`, call `el.scrollIntoView()` per page, or find the
+   viewer's page-jump JS API, with a wait for images to decode between steps.
+4. Try `--disable-dev-shm-usage` REMOVED is already done; if IO still won't fire,
+   test `--force-device-scale-factor=1` + no CDP emulation (real window size).
+
+**Iterate:** edit worker.py → push main → wait worker CI (`gh run watch`) →
+Portainer stack 13 "Redeploy from git repository → Pull and redeploy" (Update;
+`pull_policy: always` pulls the new image; **retry once** if it errors "Could not
+get the contents of the file …" — transient) → `curl -m 480
+http://10.0.0.91:8194/pdf/5739597` → read stack-13 container logs (the
+`DIAG[...]` + `log()` lines are live thanks to `PYTHONUNBUFFERED=1`). Env-only
+knobs that need NO rebuild (set in compose, just redeploy): `VP_W/VP_H/VP_SCALE`,
+`CHROME_EXTRA_ARGS`, `HARVEST_TIMEOUT`, `CDP_CALL_TIMEOUT`.
 
 **Deploy gotchas already solved (don't rediscover):**
 - **`xauth`** is a *runtime* dep of `xvfb-run` and a *separate* Debian package
