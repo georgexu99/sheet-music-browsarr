@@ -55,6 +55,8 @@ import asyncio
 import base64
 import json
 import os
+import shutil
+import subprocess
 import time
 import nodriver as uc
 from nodriver import cdp
@@ -472,34 +474,92 @@ async def harvest_pages(browser, score_id: str):
             pass
 
 
+def chrome_binary() -> str | None:
+    for name in ("google-chrome", "google-chrome-stable", "chrome"):
+        p = shutil.which(name)
+        if p:
+            return p
+    return None
+
+
+def chrome_stderr_probe(args: list[str]) -> str:
+    """Launch Chrome directly for a few seconds and capture its stderr.
+    nodriver pipes (and never reads) the browser's stderr, so when the launch
+    dies the actual crash reason is invisible — this probe recovers it. Only
+    used after a failed start; returns a short trimmed transcript."""
+    exe = chrome_binary()
+    if not exe:
+        return "chrome binary not found on PATH"
+    probe_args = [exe, *args, "--user-data-dir=/tmp/chrome-probe",
+                  "--remote-debugging-port=9223", "about:blank"]
+    try:
+        p = subprocess.run(probe_args, capture_output=True, text=True, timeout=8)
+        out = (p.stderr or "") + (p.stdout or "")
+        return f"exit={p.returncode} :: {out.strip()[:1200]}"
+    except subprocess.TimeoutExpired as e:
+        # Still alive after 8 s = it actually launched fine.
+        out = (e.stderr or b"").decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        return f"probe survived 8s (launch OK) :: {out.strip()[:600]}"
+    except Exception as e:
+        return f"probe failed to run: {e}"
+
+
 class Worker:
     def __init__(self):
         self.browser = None
         self.lock = asyncio.Lock()
 
-    async def get_browser(self):
-        if self.browser is None:
-            win = os.environ.get("WINDOW", "1500,1000")
-            args = [
-                f"--window-size={win}",
-                # Under xvfb-run there is no window manager, so Chrome can
-                # consider its window permanently unfocused/occluded and
-                # throttle rendering + timers — which kills the score viewer's
-                # scroll-triggered lazy-load (IntersectionObserver / rAF never
-                # fire). Harmless on a desktop.
+    def _chrome_args(self) -> list[str]:
+        win = os.environ.get("WINDOW", "1500,1000")
+        args = [f"--window-size={win}"]
+        # Under xvfb-run there is no window manager, so Chrome can consider
+        # its window permanently unfocused/occluded and throttle rendering +
+        # timers — which kills the score viewer's scroll-triggered lazy-load
+        # (IntersectionObserver / rAF never fire). Harmless on a desktop.
+        # THROTTLE_FLAGS=off removes them without a rebuild (escape hatch in
+        # case a Chrome build chokes on them).
+        if os.environ.get("THROTTLE_FLAGS", "on") != "off":
+            args += [
                 "--disable-background-timer-throttling",
                 "--disable-backgrounding-occluded-windows",
                 "--disable-renderer-backgrounding",
             ]
-            # In Docker we run headful Chrome as root under Xvfb; Chrome refuses
-            # the sandbox as root. CHROME_EXTRA_ARGS lets the image inject
-            # `--no-sandbox` without changing the desktop-tested path
-            # (var unset => identical to before).
-            extra = os.environ.get("CHROME_EXTRA_ARGS", "").split()
-            args.extend(extra)
-            log("starting Chrome")
-            self.browser = await uc.start(headless=False, browser_args=args)
-            log("Chrome started")
+        # In Docker we run headful Chrome as root under Xvfb; Chrome refuses
+        # the sandbox as root (nodriver also auto-adds --no-sandbox as root).
+        # CHROME_EXTRA_ARGS lets the image inject `--no-sandbox` without
+        # changing the desktop-tested path (var unset => identical to before).
+        args.extend(os.environ.get("CHROME_EXTRA_ARGS", "").split())
+        return args
+
+    async def get_browser(self):
+        if self.browser is None:
+            args = self._chrome_args()
+            exe = chrome_binary()
+            if exe:
+                try:
+                    v = subprocess.run([exe, "--version"], capture_output=True,
+                                       text=True, timeout=10).stdout.strip()
+                    log(f"chrome binary: {exe} ({v})")
+                except Exception:
+                    pass
+            last_err = None
+            for attempt in (1, 2, 3):
+                log(f"starting Chrome (attempt {attempt}, args={args})")
+                try:
+                    self.browser = await uc.start(headless=False, browser_args=args)
+                    log("Chrome started")
+                    return self.browser
+                except Exception as e:
+                    last_err = e
+                    log(f"Chrome start attempt {attempt} failed: {type(e).__name__}: {e}")
+                    await asyncio.sleep(2 * attempt)
+            # All attempts failed: recover the real crash reason from a direct
+            # launch so the 500 body / logs say WHY instead of nodriver's
+            # generic "Failed to connect to browser".
+            probe = chrome_stderr_probe(args)
+            log(f"chrome stderr probe: {probe}")
+            raise RuntimeError(
+                f"chrome failed to start after 3 attempts: {last_err} | probe: {probe}")
         return self.browser
 
     def reset_browser(self):
