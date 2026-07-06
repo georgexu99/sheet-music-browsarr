@@ -28,6 +28,7 @@ import asyncio
 import base64
 import json
 import os
+import time
 import nodriver as uc
 from nodriver import cdp
 from aiohttp import web
@@ -140,21 +141,24 @@ async def harvest_pages(browser, score_id: str):
 
         captured: dict[int, bytes] = {}
         mh = ""
-        # warm-up: one scroll so every page loads once and the main hash is known
+        # warm-up: one scroll so every page loads once and the main hash is known.
+        # Per-iter logging (with timing) so a wedge shows exactly which STEP_JS
+        # call blocks under Xvfb, and whether it's a hang (no line after
+        # "calling") vs slow (large elapsed) vs a timeout cascade.
         for i in range(60):
+            t0 = time.monotonic()
+            log(f"score {score_id}: warm-up iter {i}: calling STEP_JS")
             try:
                 r = await asyncio.wait_for(_ejson(tab, STEP_JS), timeout=CDP_CALL_TIMEOUT)
                 mh = r.get("mh") or mh
-                if i == 0:
-                    log(f"score {score_id}: warm-up ok, best={r.get('best', 0)} mh={(mh or '?')[:8]}")
-                if r.get("best", 0) >= pc:
+                best = r.get("best", 0)
+                log(f"score {score_id}: warm-up iter {i}: best={best} ({time.monotonic() - t0:.1f}s)")
+                if best >= pc:
                     break
             except asyncio.TimeoutError:
-                if i == 0:
-                    log(f"score {score_id}: warm-up STEP_JS HUNG ({CDP_CALL_TIMEOUT}s) on iter 0")
+                log(f"score {score_id}: warm-up iter {i}: TIMEOUT after {CDP_CALL_TIMEOUT}s")
             except Exception as e:
-                if i == 0:
-                    log(f"score {score_id}: warm-up iter 0 error: {e}")
+                log(f"score {score_id}: warm-up iter {i}: error {type(e).__name__}: {e}")
             await asyncio.sleep(0.3)
         if not mh:
             raise RuntimeError("no page images found")
