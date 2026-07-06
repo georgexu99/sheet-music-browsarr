@@ -106,6 +106,11 @@ struct SearchPage {
     /// deferred sources are currently selected. Only shown when the loader
     /// renders (i.e. `musescore_defer_url` is `Some`).
     deferred_label: String,
+    /// True when the MuseScore PDF worker is configured — MuseScore cards
+    /// then link to `/pdf/musescore/{id}` (real in-app PDF) instead of
+    /// linking out to musescore.com. Referenced by `_result_card.html`,
+    /// so every struct that (transitively) includes it carries this flag.
+    musescore_pdf: bool,
 }
 
 #[derive(Template)]
@@ -117,6 +122,7 @@ struct ResultsPartial {
     musescore_defer_url: Option<String>,
     musescore_pending: bool,
     deferred_label: String,
+    musescore_pdf: bool,
 }
 
 /// Deferred MuseScore block, returned by `/search?defer=musescore&…`.
@@ -126,6 +132,7 @@ struct ResultsPartial {
 #[template(path = "search_musescore.html")]
 struct MusescorePartial {
     results: Vec<SearchResult>,
+    musescore_pdf: bool,
 }
 
 /// Infinite-scroll append response. Same shape as `ResultsPartial` — both
@@ -142,6 +149,21 @@ struct ResultsAppendPartial {
     /// page 1, never during infinite-scroll. Present only because the
     /// shared `_search_results_items.html` references it.
     musescore_pending: bool,
+    musescore_pdf: bool,
+}
+
+/// True when `MUSESCORE_PDF_WORKER_URL` is configured, i.e. the MuseScore
+/// PDF path is expected to work and result cards should offer an in-app
+/// "Open PDF" instead of linking out. Mirrors the env parsing in
+/// `sources::musescore` (trimmed, non-empty). Cached: env doesn't change
+/// at runtime.
+fn musescore_pdf_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MUSESCORE_PDF_WORKER_URL")
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 struct SourceFilterOption {
@@ -433,6 +455,7 @@ async fn home(State(state): State<AppState>) -> impl IntoResponse {
         musescore_defer_url: None,
         musescore_pending: false,
         deferred_label: String::new(),
+        musescore_pdf: musescore_pdf_enabled(),
     }
 }
 
@@ -512,7 +535,11 @@ async fn search(
             None,
         );
         if is_defer {
-            return MusescorePartial { results: Vec::new() }.into_response();
+            return MusescorePartial {
+                results: Vec::new(),
+                musescore_pdf: musescore_pdf_enabled(),
+            }
+            .into_response();
         }
         if is_append {
             return empty_append(&query);
@@ -533,7 +560,11 @@ async fn search(
         // mostly return noise. Return an empty result set silently — the
         // user will keep typing.
         if is_defer {
-            return MusescorePartial { results: Vec::new() }.into_response();
+            return MusescorePartial {
+                results: Vec::new(),
+                musescore_pdf: musescore_pdf_enabled(),
+            }
+            .into_response();
         }
         if is_append {
             return empty_append(&query);
@@ -716,7 +747,11 @@ async fn search(
     // the fan-out closure above.
     if is_defer {
         results.truncate(SEARCH_PAGE_SIZE);
-        return MusescorePartial { results }.into_response();
+        return MusescorePartial {
+            results,
+            musescore_pdf: musescore_pdf_enabled(),
+        }
+        .into_response();
     }
 
     // Page-1 shows the first SEARCH_PAGE_SIZE; page-N shows the first
@@ -776,6 +811,7 @@ async fn search(
             results: new_items,
             next_page,
             musescore_pending: false,
+            musescore_pdf: musescore_pdf_enabled(),
         }
         .into_response();
     }
@@ -851,6 +887,7 @@ fn empty_append(query: &str) -> Response {
         results: Vec::new(),
         next_page: None,
         musescore_pending: false,
+        musescore_pdf: musescore_pdf_enabled(),
     }
     .into_response()
 }
@@ -878,6 +915,7 @@ fn render_response(
             musescore_defer_url,
             musescore_pending,
             deferred_label,
+            musescore_pdf: musescore_pdf_enabled(),
         }
         .into_response()
     } else {
@@ -906,6 +944,7 @@ fn render_response(
             musescore_defer_url,
             musescore_pending,
             deferred_label,
+            musescore_pdf: musescore_pdf_enabled(),
         }
         .into_response()
     }
