@@ -1,74 +1,86 @@
 # MuseScore PDF worker — handoff / resume doc
 
-**Status (2026-07-05): DEPLOYED to the NAS. Container is healthy and — the big
-one — Chrome-under-Xvfb-in-Docker CLEARS the Cloudflare Turnstile. One blocker
-left: the screenshot-capture phase hangs in-container (works on desktop).**
-This doc is self-contained so you can `/clear` and resume from here.
+**Status (2026-07-06): harvest REWRITTEN and verified on the desktop (7/7
+white pages, ~2 MB PDF, ~22 s vs ~160 s before). The 1/7-pages blocker fix is
+ready to deploy to the NAS — deploy + in-container verification pending
+(needs a Portainer login).** This doc is self-contained so you can `/clear`
+and resume from here.
 
-## ⭐ 2026-07-05 deployment session — READ THIS FIRST
+## ⭐ 2026-07-06 session — harvest rewrite (READ THIS FIRST)
 
 **Worker is live on the NAS:** Portainer stack `musescore-pdf-worker` (stack
 **id=13**, endpoint 3), publishes **8194**, pulls
 `ghcr.io/georgexu99/musescore-pdf-worker:latest` (a **public** GHCR package). CI
 (`.github/workflows/musescore-pdf-worker.yml`) builds+pushes it on every push to
-`main`. Branch merged to main; main HEAD ≈ `4bc02d0`.
+`main`.
 
-**✅ CORE RISK RETIRED:** container logs on a real `/pdf/5739597` request show:
-```
-[worker] starting Chrome
-[worker] Chrome started
-[worker] score 5739597: navigating to score page
-[worker] score 5739597: challenge cleared, pages_count=7
-```
-So **Xvfb + headful Chrome in Docker passes the Turnstile** and reads the score.
-This was the whole project's open question. Answered: yes.
+**✅ CORE RISK RETIRED (2026-07-05):** Xvfb + headful Chrome in Docker passes
+the Turnstile and reads the score (`challenge cleared, pages_count=7` in
+container logs). **🚧 The remaining blocker was: only page 0 ever harvested —
+the viewer virtualizes pages and its scroll-triggered lazy-load didn't fire
+under Xvfb** (page 0 loaded fine; pages 1-6 never entered the DOM; NOT a
+CDN/fingerprint block).
 
-**🚧 BLOCKER (next task): only page 0 harvests — pages 1-6 never enter the DOM.**
-Fully diagnosed via in-container `DIAG_JS` logging (worker.py). The request now
-runs to completion and returns **422 `captured 1/7 pages; missing [1..6]`** (no
-longer a hang). The `DIAG[pre-warmup]` snapshot is the smoking gun:
-```
-scEx:true  scTop:0  scH:8913  docH:2200  winH:2200
-imgTotal:34  scoreImgs:10  scorePages:"0"  scoreLoaded:10
-```
-Read that as: the score-viewer scroll container **exists** and is **tall enough
-for all 7 pages** (scrollHeight 8913), page 0's images **load fine** (10/10
-decoded) — so it is **NOT** a Cloudflare/CDN fingerprint block and **NOT** a
-missing scroller. The problem is purely that **only `score_0` images are ever in
-the DOM** (`scorePages:"0"`); the viewer virtualizes and lazy-loads pages 1-6 as
-they scroll into view, and **that scroll-triggered lazy-load doesn't fire under
-Xvfb**. The harvest scrolls `#jmuse-scroller-component` but pages 1-6 never
-materialize, so `best` stays at 1 and only page 0 is captured. (Two earlier
-red-herrings are now RESOLVED: the "hang" was CDP slowness from
-`--disable-dev-shm-usage` — removed, CDP is ~0.0 s now; and neither the emulation
-nor the evaluate loop hangs.)
+**The rewrite (worker.py) attacks that from four sides at once** (each is
+independently plausible as the fix; bundled because a deploy cycle is slow):
+1. **Anti-throttling Chrome flags** (`--disable-background-timer-throttling`,
+   `--disable-backgrounding-occluded-windows`,
+   `--disable-renderer-backgrounding`) + **CDP focus emulation** +
+   `bringToFront` — under xvfb-run there is no window manager, so Chrome can
+   consider its window permanently unfocused/occluded and throttle the
+   rendering lifecycle, which is exactly what IntersectionObserver-driven
+   lazy-load dies of.
+2. **Dynamic chunked viewport:** after `pages_count` is known, the emulated
+   viewport is resized to `min(scrollHeight+250, VP_H_MAX=3800)` so ~2-3 pages
+   are fully visible per chunk; the scroller is then stepped through a handful
+   of chunk positions (`vp_h - page_h - 220` step, so every page is FULLY
+   visible in ≥1 chunk) instead of ~90 blind 240-px micro-steps.
+3. **Real input-pipeline scrolling:** each chunk position is reached by a
+   native `scrollTop` write + dispatched `scroll` events, VERIFIED by reading
+   `scrollTop` back; if the write didn't take, it falls back to real CDP
+   `mouseWheel` events (`Input.dispatchMouseEvent`) aimed at the scroller —
+   the same path a human wheel-scroll takes, which triggers any custom
+   wheel/scroll-driven lazy-load.
+4. **Self-diagnosing failures:** DIAG now reports `visibilityState`,
+   `hasFocus`, and a rAF tick counter (flat `raf` between snapshots = Chrome
+   isn't producing frames = throttling theory confirmed), and the **last DIAG
+   snapshot is embedded in the 422 error body**, so a failed NAS request is
+   diagnosable from `curl` output alone — no container logs needed.
 
-**Prime hypothesis:** the viewer's lazy-load keys off `IntersectionObserver`,
-which doesn't fire reliably under the emulated viewport + Xvfb virtual display
-(programmatic `scrollTop` changes don't produce intersection callbacks).
-**Candidate fixes to try (each is one edit→push→CI→redeploy→test cycle):**
-1. **Check whether the scroll even advances** — the `DIAG[warmup-20/50]`
-   snapshots log `scTop` after scrolling. If `scTop` stays 0, the scroll isn't
-   moving (fix the scroll target/events); if `scTop` advances but `scorePages`
-   stays "0", it's the IntersectionObserver/lazy-load theory.
-2. **Make all pages visible at once so no lazy-load is needed:** set a very tall
-   emulated viewport (e.g. `VP_H`≈`scH`+margin at `VP_SCALE=1`, or size the Xvfb
-   screen + window tall) so all 7 pages are in-viewport → the viewer loads them
-   all → then screenshot each. Watch for OOM on an 8900px×2 surface.
-3. **Poke the lazy-load explicitly:** dispatch real `scroll`/`wheel` events on
-   `#jmuse-scroller-component`, call `el.scrollIntoView()` per page, or find the
-   viewer's page-jump JS API, with a wait for images to decode between steps.
-4. Try `--disable-dev-shm-usage` REMOVED is already done; if IO still won't fire,
-   test `--force-device-scale-factor=1` + no CDP emulation (real window size).
+Plus two capture-quality guards found during desktop verification:
+- **Settled-page check:** the viewer fades each page in over its gray body; a
+  capture racing the fade-in screenshots the page ~55% dimmed (uniform gray
+  bg). Pages are now only captured at full opacity with nothing translucent
+  painted over them (`elementsFromPoint` walk), with a 6-s escape hatch that
+  captures dimmed anyway (a dimmed page beats a missing page).
+- **Rect-stability guard:** a layout shift between rect measurement and
+  screenshot (e.g. the video-lesson banner expanding above page 0 right at
+  viewer-ready) shifts the clip onto the wrong strip. After screenshots, page
+  rects are re-measured and any shot whose rect moved >4 px is discarded and
+  retried on the next poll. (Both misfires were observed and reproduced on
+  the desktop; both guards verified working in the logs.)
+
+**Desktop verification (2026-07-06):** `PORT=8899 py worker.py` +
+`curl /pdf/5739597` → HTTP 200, 2,049,998 bytes, **7/7 pages, all pure-white
+margins**, ~22 s end-to-end. Page contents visually verified (title page,
+middle page, final page with end barline).
 
 **Iterate:** edit worker.py → push main → wait worker CI (`gh run watch`) →
 Portainer stack 13 "Redeploy from git repository → Pull and redeploy" (Update;
 `pull_policy: always` pulls the new image; **retry once** if it errors "Could not
 get the contents of the file …" — transient) → `curl -m 480
-http://10.0.0.91:8194/pdf/5739597` → read stack-13 container logs (the
-`DIAG[...]` + `log()` lines are live thanks to `PYTHONUNBUFFERED=1`). Env-only
+http://10.0.0.91:8194/pdf/5739597` → on failure, read the 422 body's `diag=`
+payload first; stack-13 container logs have the full `log()` trail. Env-only
 knobs that need NO rebuild (set in compose, just redeploy): `VP_W/VP_H/VP_SCALE`,
-`CHROME_EXTRA_ARGS`, `HARVEST_TIMEOUT`, `CDP_CALL_TIMEOUT`.
+`VP_H_MAX`, `PASSES`, `CHUNK_WAIT`, `CHROME_EXTRA_ARGS`, `HARVEST_TIMEOUT`,
+`CDP_CALL_TIMEOUT`.
+- If the NAS still misses pages and the 422 `diag` shows a **flat `raf`** or
+  `foc:0`/`vis!=="visible"`, rendering is still throttled: try
+  `CHROME_EXTRA_ARGS="--no-sandbox --disable-features=CalculateNativeWinOcclusion"`
+  or running a minimal WM in the container.
+- If `scTop` stays 0 in `diag` even with the wheel fallback, the scroller
+  changed its scrolling mechanism — look for the "scrollTop write ineffective"
+  + wheel lines in the container log.
 
 **Deploy gotchas already solved (don't rediscover):**
 - **`xauth`** is a *runtime* dep of `xvfb-run` and a *separate* Debian package
@@ -290,9 +302,11 @@ HTML). Repoint stack 7 off `FLARESOLVERR_URL` if no longer used by MuseScore
       Container healthy; `/healthz` = ok.
 - [x] **Proved Xvfb-in-Docker clears the Turnstile** (`challenge cleared,
       pages_count=7` in the container logs). ⭐ core risk retired.
-- [ ] **FIX THE CAPTURE HANG** (top of doc): harvest stalls right after the
-      challenge clears (emulation/`set_device_metrics_override` or STEP_JS under
-      Xvfb). Then `curl .../pdf/5739597` should return a real ~2 MB %PDF.
+- [x] **Fix the 1/7-pages harvest blocker** — rewritten (see top of doc);
+      desktop-verified 7/7 white pages in ~22 s.
+- [ ] **Redeploy stack 13 + in-container verify:**
+      `curl -m 480 http://10.0.0.91:8194/pdf/5739597` → ~2 MB 7-page %PDF.
+      (Needs a Portainer login — agent session can't authenticate itself.)
 - [ ] Fix the app auto-deploy webhook (404) OR redeploy stack 7 manually so the
       live app runs the worker-wiring code.
 - [ ] Set `MUSESCORE_PDF_WORKER_URL=http://10.0.0.91:8194` on app stack 7,
