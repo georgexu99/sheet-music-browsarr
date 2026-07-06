@@ -67,6 +67,31 @@ STEP_JS = r"""(() => {
   return JSON.stringify({best, mh});
 })()"""
 
+# One-shot diagnostic: reports the viewer's scroll container + the score <img>
+# inventory (which page indices are in the DOM, how many decoded). Tells us
+# whether the harvest stall is "scroll isn't advancing" vs "page images never
+# load" vs "wrong scroll container".
+DIAG_JS = r"""(() => {
+  const sc=document.querySelector('#jmuse-scroller-component');
+  const imgs=[...document.querySelectorAll('img')];
+  const score=imgs.map(i=>({s:(i.currentSrc||i.src||''),c:i.complete,nw:i.naturalWidth}))
+                  .filter(x=>/\/g\/[0-9a-f]+\/score_\d+\./i.test(x.s));
+  const pages=[...new Set(score.map(x=>(x.s.match(/score_(\d+)/)||[])[1]))].filter(v=>v!=null).sort((a,b)=>a-b);
+  return JSON.stringify({
+    scEx: !!sc,
+    scTop: sc?Math.round(sc.scrollTop):-1,
+    scH: sc?sc.scrollHeight:-1,
+    winScrollY: Math.round(window.scrollY),
+    docH: document.documentElement.scrollHeight,
+    winH: window.innerHeight,
+    imgTotal: imgs.length,
+    scoreImgs: score.length,
+    scorePages: pages.join(','),
+    scoreLoaded: score.filter(x=>x.c&&x.nw>0).length,
+    sample: score.slice(0,2).map(x=>x.s.replace(/^https?:\/\//,'').slice(0,70))
+  });
+})()"""
+
 PAGES_JS = "(window.UGAPP&&UGAPP.store&&UGAPP.store.page&&UGAPP.store.page.data&&UGAPP.store.page.data.score)?UGAPP.store.page.data.score.pages_count:0"
 
 
@@ -145,21 +170,31 @@ async def harvest_pages(browser, score_id: str):
         # Per-iter logging (with timing) so a wedge shows exactly which STEP_JS
         # call blocks under Xvfb, and whether it's a hang (no line after
         # "calling") vs slow (large elapsed) vs a timeout cascade.
+        async def diag(tag):
+            try:
+                d = await asyncio.wait_for(_ejson(tab, DIAG_JS), timeout=CDP_CALL_TIMEOUT)
+                log(f"score {score_id}: DIAG[{tag}] {json.dumps(d)}")
+            except Exception as e:
+                log(f"score {score_id}: DIAG[{tag}] failed: {e}")
+
+        await diag("pre-warmup")
         for i in range(60):
-            t0 = time.monotonic()
-            log(f"score {score_id}: warm-up iter {i}: calling STEP_JS")
             try:
                 r = await asyncio.wait_for(_ejson(tab, STEP_JS), timeout=CDP_CALL_TIMEOUT)
                 mh = r.get("mh") or mh
                 best = r.get("best", 0)
-                log(f"score {score_id}: warm-up iter {i}: best={best} ({time.monotonic() - t0:.1f}s)")
+                if i % 10 == 0 or best >= pc:
+                    log(f"score {score_id}: warm-up iter {i}: best={best}")
                 if best >= pc:
                     break
             except asyncio.TimeoutError:
                 log(f"score {score_id}: warm-up iter {i}: TIMEOUT after {CDP_CALL_TIMEOUT}s")
             except Exception as e:
                 log(f"score {score_id}: warm-up iter {i}: error {type(e).__name__}: {e}")
+            if i in (20, 50):
+                await diag(f"warmup-{i}")
             await asyncio.sleep(0.3)
+        await diag("post-warmup")
         if not mh:
             raise RuntimeError("no page images found")
         log(f"score {score_id}: main hash {mh[:8]} found; starting capture passes")
