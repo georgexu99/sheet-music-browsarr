@@ -1,10 +1,67 @@
 # MuseScore PDF worker — handoff / resume doc
 
-**Status (2026-07-06): harvest REWRITTEN and verified on the desktop (7/7
-white pages, ~2 MB PDF, ~22 s vs ~160 s before). The 1/7-pages blocker fix is
-ready to deploy to the NAS — deploy + in-container verification pending
-(needs a Portainer login).** This doc is self-contained so you can `/clear`
-and resume from here.
+**Status (2026-07-06): harvest REBUILT around the jmuse API (no more
+scroll/screenshot). Desktop-verified 7/7 pages, 3.4 MB PDF, ~340 DPI, ~19 s.
+This is the Xvfb-proof design — deploy + in-container verification pending
+(needs a Portainer login / stack-13 redeploy click).** Self-contained so you
+can `/clear` and resume from here.
+
+## ⭐ 2026-07-06 (latest) — jmuse harvest, the real fix. READ FIRST.
+
+The screenshot-the-scrolling-viewer approach (all the sections below) was
+abandoned: it depends on the viewer's scroll-triggered lazy-load, which fires
+on a real display but **never under Xvfb-in-Docker** — pinned via in-container
+DIAG (`scTop` advanced, `raf` ticked, `foc=1`, `vis=visible`, yet `scorePages`
+stayed `"0"`; only page 0 ever entered the DOM). Forcing headless clears that
+lazy-load problem but **fails the Cloudflare Turnstile**, so headless is out.
+
+**The replacement (current worker.py) bypasses the viewer entirely.** MuseScore
+loads page 0 from a signed preload URL; pages 1..N come from a token-gated
+**same-origin** API:
+
+    GET /api/jmuse?id=<id>&index=<n>&type=img
+    Authorization: md5(f"{id}img{index}{SALT}")[:4]        # 4 hex chars
+
+`SALT` is a build constant in a MuseScore JS bundle, sitting right before a
+`.substr(0,4)` — e.g. `(e+t+r+"61256397").substr(0,4)`. The worker:
+1. Loads the score page in headful Chrome (clears the Turnstile → valid
+   `cf_clearance` + fingerprint session).
+2. Recovers `SALT`: regex the loaded same-origin bundles for
+   `"<lit>").substr(0,4)`; falls back to hardcoded constants
+   (`61256397`, then dl-librescore's `9654,4e`). Self-validates by minting a
+   token and calling jmuse — the first salt that returns a URL wins, so a
+   stale constant is harmless.
+3. For each page: mint token → **in-page** `fetch('/api/jmuse?…')` (must run
+   inside the challenge-passed page; a server-side fetch gets 403/CAPTCHA) →
+   get the signed CDN URL → inject it as a full-width `<img>` → CDP
+   `capture_screenshot` of the image rect at `PAGE_SCALE` (2×).
+4. `img2pdf` stitches the PNGs.
+
+**Why this is Xvfb-proof:** no scroll, no IntersectionObserver, no viewer
+virtualization. It only needs image loading + screenshot, which already worked
+under Xvfb (page 0 always captured). The salt-minting chunk loads at page init
+(no scroll needed — confirmed: extraction succeeds with zero scrolling).
+
+**Desktop verification:** `GET /pdf/5739597` → 200, 7 pages, 3,476,536 bytes,
+each page 2800×3958 (~340 DPI), ~19 s. Log shows `salt OK (extracted, len=8)`
+(runtime extraction working) + all 7 `captured page N`.
+
+**Env knobs (new):** `PAGE_W` (CSS width per page, default 1400),
+`PAGE_SCALE` (device scale / DPI multiplier, default 2), `HEADLESS` (debug
+only — fails the challenge). Removed the old scroll knobs (`VP_*`, `PASSES`,
+`CHUNK_WAIT`).
+
+**If it breaks after a MuseScore deploy:** almost always the salt. Re-derive
+it: open a free score in a normal browser, capture the `Authorization` on any
+`/api/jmuse?...index=N...` request (DevTools network), then find the string `X`
+where `md5(f"{id}img{N}{X}")[:4]` equals that token — it's the literal before
+`.substr(0,4)` in the current bundle. Update `FALLBACK_SALTS[0]`. The runtime
+extractor should already catch it if the regex still matches.
+
+---
+_Everything below is the OBSOLETE scroll/screenshot era, kept for context._
+
+---
 
 ## ⭐ 2026-07-06 session — harvest rewrite (READ THIS FIRST)
 
