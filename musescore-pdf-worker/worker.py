@@ -302,10 +302,13 @@ async def harvest_pages(browser, score_id: str):
 
 
 def chrome_binary():
+    p = os.environ.get("CHROME_PATH")
+    if p and os.path.exists(p):
+        return p
     for name in ("google-chrome", "google-chrome-stable", "chrome"):
-        p = shutil.which(name)
-        if p:
-            return p
+        w = shutil.which(name)
+        if w:
+            return w
     return None
 
 
@@ -358,11 +361,18 @@ class Worker:
                     log(f"chrome binary: {exe} ({v})")
                 except Exception:
                     pass
+            # Pin Chrome via CHROME_PATH (a Chrome-for-Testing build) when set,
+            # so the container isn't at the mercy of `google-chrome-stable`
+            # auto-bumping to a version nodriver can't drive (Chrome 150 broke
+            # the launch/CDP handshake under Xvfb; 149 is stable).
+            chrome_path = os.environ.get("CHROME_PATH") or None
             last_err = None
             for attempt in (1, 2, 3):
-                log(f"starting Chrome (attempt {attempt}, headless={headless}, args={args})")
+                log(f"starting Chrome (attempt {attempt}, headless={headless}, path={chrome_path}, args={args})")
                 try:
-                    self.browser = await uc.start(headless=headless, browser_args=args)
+                    self.browser = await uc.start(
+                        headless=headless, browser_args=args,
+                        browser_executable_path=chrome_path)
                     log("Chrome started")
                     return self.browser
                 except Exception as e:
