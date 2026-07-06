@@ -47,9 +47,22 @@ each page 2800×3958 (~340 DPI), ~19 s. Log shows `salt OK (extracted, len=8)`
 (runtime extraction working) + all 7 `captured page N`.
 
 **Env knobs (new):** `PAGE_W` (CSS width per page, default 1400),
-`PAGE_SCALE` (device scale / DPI multiplier, default 2), `HEADLESS` (debug
-only — fails the challenge). Removed the old scroll knobs (`VP_*`, `PASSES`,
-`CHUNK_WAIT`).
+`PAGE_SCALE` (device scale / DPI multiplier, default 2), `CHROME_PATH` (pinned
+browser binary), `HEADLESS` (debug only — fails the challenge). Removed the old
+scroll knobs (`VP_*`, `PASSES`, `CHUNK_WAIT`).
+
+**⚠️ Chrome is PINNED to 149 (Chrome-for-Testing).** The first NAS image
+cleared the challenge on Chrome 149; a later rebuild auto-bumped
+`google-chrome-stable` to **Chrome 150, which broke nodriver 0.50.3 under
+Xvfb** — Chrome failed to start (empty nodriver exception, 2 retries) and the
+DevTools socket died mid-run (`no close frame received or sent`). The desktop
+was unaffected (local Chrome still 149). Fix: the Dockerfile installs
+`google-chrome-stable` only for its dependency/font closure and additionally
+unpacks a pinned **CfT 149.0.7827.155** build to `/opt/chrome-linux64/chrome`,
+with `ENV CHROME_PATH` pointing nodriver at it. CfT 149 verified locally: clears
+the Turnstile + harvests 7/7 pages. To bump Chrome later, change the CfT version
+in the Dockerfile + `CHROME_PATH` and re-verify it drives cleanly (newer Chrome
+may need a newer nodriver — bump `requirements.txt` together).
 
 **If it breaks after a MuseScore deploy:** almost always the salt. Re-derive
 it: open a free score in a normal browser, capture the `Authorization` on any

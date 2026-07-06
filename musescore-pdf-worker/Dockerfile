@@ -20,14 +20,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   * fonts-* — so rendered pages aren't tofu boxes (sheet music has text:
 #     titles, tempo marks, lyrics).
 #   * dumb-init — proper PID 1 so SIGTERM reaps Chrome's process tree cleanly.
+# google-chrome-stable is installed ONLY for its runtime dependency closure
+# (nss, atk, gtk, cups, drm, fonts, ...). We do NOT drive it: its auto-bumped
+# `_current` binary reached Chrome 150, which broke nodriver 0.50.3's launch /
+# CDP handshake under Xvfb (fails to start, then the DevTools socket dies).
+# The DRIVEN browser is a PINNED Chrome-for-Testing 149 build (CHROME_PATH),
+# which nodriver drives reliably — matching the version proven on the desktop.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget gnupg ca-certificates xvfb xauth dumb-init \
+        wget gnupg ca-certificates xvfb xauth dumb-init unzip \
         fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
     && wget -q -O /tmp/chrome.deb \
         https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
     && rm -f /tmp/chrome.deb \
+    && wget -q -O /tmp/cft.zip \
+        https://storage.googleapis.com/chrome-for-testing-public/149.0.7827.155/linux64/chrome-linux64.zip \
+    && unzip -q /tmp/cft.zip -d /opt \
+    && rm -f /tmp/cft.zip \
     && rm -rf /var/lib/apt/lists/*
+
+# Drive the pinned CfT build, not the auto-updating system Chrome.
+ENV CHROME_PATH=/opt/chrome-linux64/chrome
 
 WORKDIR /app
 COPY requirements.txt .
