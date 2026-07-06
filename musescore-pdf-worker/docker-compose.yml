@@ -35,7 +35,12 @@ services:
     shm_size: "2gb"
     environment:
       PORT: "8194"
-      CHROME_EXTRA_ARGS: "--no-sandbox --disable-dev-shm-usage"
+      # Only --no-sandbox (root Chrome). We deliberately DON'T set
+      # --disable-dev-shm-usage: with shm_size:2gb below, /dev/shm is ample, and
+      # that flag forces Chrome onto disk-backed /tmp which slows rendering +
+      # image decode — under Xvfb that manifested as the score viewer never
+      # lazy-loading pages past page 0 (harvest stalled at best=1).
+      CHROME_EXTRA_ARGS: "--no-sandbox"
       # The TerraMaster CPU renders + screenshots slower than a dev desktop
       # (~160 s there); give the harvest generous headroom so it isn't cut off
       # mid-capture. The public "Open PDF" path should route slow scores through
