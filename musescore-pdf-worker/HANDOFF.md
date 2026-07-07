@@ -51,18 +51,32 @@ each page 2800×3958 (~340 DPI), ~19 s. Log shows `salt OK (extracted, len=8)`
 browser binary), `HEADLESS` (debug only — fails the challenge). Removed the old
 scroll knobs (`VP_*`, `PASSES`, `CHUNK_WAIT`).
 
-**⚠️ Chrome is PINNED to 149 (Chrome-for-Testing).** The first NAS image
-cleared the challenge on Chrome 149; a later rebuild auto-bumped
-`google-chrome-stable` to **Chrome 150, which broke nodriver 0.50.3 under
-Xvfb** — Chrome failed to start (empty nodriver exception, 2 retries) and the
-DevTools socket died mid-run (`no close frame received or sent`). The desktop
-was unaffected (local Chrome still 149). Fix: the Dockerfile installs
-`google-chrome-stable` only for its dependency/font closure and additionally
-unpacks a pinned **CfT 149.0.7827.155** build to `/opt/chrome-linux64/chrome`,
-with `ENV CHROME_PATH` pointing nodriver at it. CfT 149 verified locally: clears
-the Turnstile + harvests 7/7 pages. To bump Chrome later, change the CfT version
-in the Dockerfile + `CHROME_PATH` and re-verify it drives cleanly (newer Chrome
-may need a newer nodriver — bump `requirements.txt` together).
+**⚠️ Chrome is PINNED to BRANDED 149.0.7827.155** (from Google's deb pool, not
+the `_current` link). Two separate in-container failures forced this, and they
+rule out the easy fixes:
+- **Chrome 150 (`_current`)** — nodriver 0.50.3 (the newest release; there is
+  no newer one) can't launch it reliably under Xvfb: fails to start, then the
+  DevTools socket dies mid-run (`no close frame received or sent`).
+- **Chrome-for-Testing 149** — nodriver drives it fine, but **Cloudflare
+  Turnstile won't clear for CfT under Xvfb's software renderer** (CfT lacks the
+  DRM/codec/branding a real browser has → flagged; verified in-container:
+  Chrome starts, navigates, challenge never resolves → 422 "no score data").
+  My *desktop* CfT test passed only because a real-GPU fingerprint compensated.
+- **Branded 149** — the build that cleared the challenge on the first NAS
+  deploy, and the newest branded Chrome nodriver 0.50.3 drives cleanly. Still
+  in the deb pool at `.../pool/main/g/google-chrome-stable/
+  google-chrome-stable_149.0.7827.155-1_amd64.deb`. This is what the Dockerfile
+  now installs (no CfT, no `CHROME_PATH`).
+
+Also: `handle_pdf` now **resets the browser on a 422** (not just 500/timeout) —
+a challenge that didn't clear poisons the session, so the next reused-browser
+request died with "no close frame"; a fresh browser per failed request also
+gives Turnstile a clean retry.
+
+To bump Chrome later: pick a still-pooled branded version, update the deb URL,
+and re-verify in-container that it both launches under nodriver 0.50.3 AND
+clears the Turnstile (if Google purges 149 from the pool and only 150+ remains,
+you're stuck until a newer nodriver ships — CfT is not a substitute here).
 
 **If it breaks after a MuseScore deploy:** almost always the salt. Re-derive
 it: open a free score in a normal browser, capture the `Authorization` on any

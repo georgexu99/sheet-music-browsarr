@@ -20,27 +20,27 @@ ENV DEBIAN_FRONTEND=noninteractive
 #   * fonts-* — so rendered pages aren't tofu boxes (sheet music has text:
 #     titles, tempo marks, lyrics).
 #   * dumb-init — proper PID 1 so SIGTERM reaps Chrome's process tree cleanly.
-# google-chrome-stable is installed ONLY for its runtime dependency closure
-# (nss, atk, gtk, cups, drm, fonts, ...). We do NOT drive it: its auto-bumped
-# `_current` binary reached Chrome 150, which broke nodriver 0.50.3's launch /
-# CDP handshake under Xvfb (fails to start, then the DevTools socket dies).
-# The DRIVEN browser is a PINNED Chrome-for-Testing 149 build (CHROME_PATH),
-# which nodriver drives reliably — matching the version proven on the desktop.
+# Pin BRANDED google-chrome-stable to 149.0.7827.155 (from Google's deb pool,
+# not the auto-updating `_current` link). Two independent reasons the pin is
+# required, both learned the hard way in-container:
+#   1. `_current` reached Chrome 150, which nodriver 0.50.3 (the newest release)
+#      cannot launch reliably under Xvfb — it fails to start, then the DevTools
+#      socket dies mid-run ("no close frame received or sent").
+#   2. Cloudflare Turnstile does NOT clear for Chrome-for-Testing under Xvfb's
+#      software renderer (CfT lacks the DRM/codec/branding a "real browser" has,
+#      so it gets flagged). Only the BRANDED build clears the challenge here —
+#      149 branded is exactly what cleared it on the first NAS deploy.
+# 149.0.7827.155 is the newest branded build nodriver 0.50.3 drives cleanly AND
+# that Turnstile accepts. If Google purges this deb from the pool, bump to the
+# next pooled 149.x (or 150.x once a newer nodriver can drive it) and re-verify.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        wget gnupg ca-certificates xvfb xauth dumb-init unzip \
+        wget gnupg ca-certificates xvfb xauth dumb-init \
         fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-cjk \
     && wget -q -O /tmp/chrome.deb \
-        https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+        https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_149.0.7827.155-1_amd64.deb \
     && apt-get install -y --no-install-recommends /tmp/chrome.deb \
     && rm -f /tmp/chrome.deb \
-    && wget -q -O /tmp/cft.zip \
-        https://storage.googleapis.com/chrome-for-testing-public/149.0.7827.155/linux64/chrome-linux64.zip \
-    && unzip -q /tmp/cft.zip -d /opt \
-    && rm -f /tmp/cft.zip \
     && rm -rf /var/lib/apt/lists/*
-
-# Drive the pinned CfT build, not the auto-updating system Chrome.
-ENV CHROME_PATH=/opt/chrome-linux64/chrome
 
 WORKDIR /app
 COPY requirements.txt .
