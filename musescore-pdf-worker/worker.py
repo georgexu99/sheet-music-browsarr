@@ -410,16 +410,16 @@ class Worker:
             except asyncio.TimeoutError:
                 log(f"score {score_id}: harvest timed out after {HARVEST_TIMEOUT}s")
                 self.reset_browser()
-                return web.json_response({"error": "harvest timed out"}, status=504)
+                return web.json_response({"error": "harvest timed out", "chrome": chrome_diag()}, status=504)
             except RuntimeError as e:
                 # Expected "can't get this score" -> 422 so the caller falls back
                 # to linking out. Browser still healthy; keep it warm.
                 log(f"score {score_id}: unharvestable: {e}")
-                return web.json_response({"error": str(e)}, status=422)
+                return web.json_response({"error": str(e), "chrome": chrome_diag()}, status=422)
             except Exception as e:
                 log(f"score {score_id}: worker error: {e}")
                 self.reset_browser()
-                return web.json_response({"error": f"worker error: {e}"}, status=500)
+                return web.json_response({"error": f"worker error: {e}", "chrome": chrome_diag()}, status=500)
         try:
             pdf = img2pdf.convert(pages)
         except Exception as e:
@@ -432,10 +432,36 @@ async def healthz(_request):
     return web.Response(text="ok")
 
 
+def chrome_diag() -> dict:
+    """What Chrome the worker will actually drive — so a failure is diagnosable
+    from an HTTP response alone (no container logs / Portainer needed)."""
+    path = chrome_binary()
+    env_path = os.environ.get("CHROME_PATH")
+    d = {"resolved": path, "CHROME_PATH": env_path,
+         "CHROME_PATH_exists": bool(env_path and os.path.exists(env_path))}
+    if path:
+        try:
+            d["version"] = subprocess.run([path, "--version"], capture_output=True,
+                                          text=True, timeout=10).stdout.strip()
+        except Exception as e:
+            d["version_error"] = str(e)
+    return d
+
+
+async def debug(_request):
+    return web.json_response({
+        "chrome": chrome_diag(),
+        "env": {k: os.environ.get(k) for k in
+                ("CHROME_EXTRA_ARGS", "HEADLESS", "PAGE_W", "PAGE_SCALE",
+                 "HARVEST_TIMEOUT", "WINDOW")},
+    })
+
+
 def main():
     worker = Worker()
     app = web.Application(client_max_size=64 * 1024 * 1024)
     app.router.add_get("/healthz", healthz)
+    app.router.add_get("/debug", debug)
     app.router.add_get("/pdf/{score_id}", worker.handle_pdf)
     port = int(os.environ.get("PORT", "8000"))
     web.run_app(app, host="0.0.0.0", port=port)
