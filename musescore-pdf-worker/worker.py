@@ -413,8 +413,14 @@ class Worker:
                 return web.json_response({"error": "harvest timed out", "chrome": chrome_diag()}, status=504)
             except RuntimeError as e:
                 # Expected "can't get this score" -> 422 so the caller falls back
-                # to linking out. Browser still healthy; keep it warm.
+                # to linking out. Reset the browser anyway: a challenge that
+                # didn't clear (or a paywalled score) leaves the session in a
+                # state where the NEXT request's navigation dies with "no close
+                # frame received or sent" on the reused connection. A fresh
+                # browser per failed request also gives the Turnstile a clean
+                # retry instead of compounding a flagged session.
                 log(f"score {score_id}: unharvestable: {e}")
+                self.reset_browser()
                 return web.json_response({"error": str(e), "chrome": chrome_diag()}, status=422)
             except Exception as e:
                 log(f"score {score_id}: worker error: {e}")
